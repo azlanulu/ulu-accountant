@@ -281,7 +281,13 @@ class SupabaseCursor:
         q.execute()
 
     def fetchone(self):
-        return self._rows[0] if self._rows else None
+        if self._rows:
+            return self._rows[0]
+        # Return an empty row instead of None so callers doing
+        # fetchone()["col"] get a clear KeyError (or 0 via .get) rather
+        # than crashing with "'NoneType' object is not subscriptable" —
+        # much easier to diagnose when a query fails silently.
+        return SupabaseRow({})
 
     def fetchall(self):
         return self._rows
