@@ -1,0 +1,32 @@
+# Local data & secrets — never commit these
+*.db
+*.db-journal
+.streamlit/secrets.toml
+
+# Reports, exports, and imports containing real guest/financial data
+ULU Accountant Reports/
+Manager Monthly Reports/
+CapEx Receipts/
+*.xlsx
+*.pdf
+*_import.csv
+
+# Scanned receipts / invoices / photos — real vendor & guest documents
+*.jpg
+*.jpeg
+*.png
+
+# One-off migration / maintenance scripts (may contain paths or logic
+# you don't want public; keep these local unless you deliberately want them shared)
+migrate_to_supabase.py
+reset_2026.py
+
+# Old backup copies
+*_v9.txt
+ulu_accountant_cloud_v2.txt
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
