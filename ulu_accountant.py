@@ -761,15 +761,20 @@ def upload_payment_file(file_bytes, file_name, kind):
         st.error(f"Attachment upload failed: {e}")
         return None
 
-def get_payment_file_url(storage_path, expires_in=3600):
-    """Return a temporary signed URL to view/download a stored attachment."""
+def get_payment_file_url(storage_path, expires_in=1209600):
+    """Return a temporary signed URL to view/download a stored attachment.
+    Default expiry is 14 days to match what's promised in the WhatsApp share message."""
     if not storage_path:
         return None
     sb = get_supabase()
     try:
         res = sb.storage.from_(PAYMENT_BUCKET).create_signed_url(storage_path, expires_in)
-        return res.get("signedURL") or res.get("signed_url") or res.get("signedUrl")
-    except Exception:
+        url = res.get("signedURL") or res.get("signed_url") or res.get("signedUrl")
+        if not url:
+            st.warning(f"Signed URL request for '{storage_path}' succeeded but returned no URL. Response: {res}")
+        return url
+    except Exception as e:
+        st.warning(f"Couldn't generate a link for '{storage_path}': {e}")
         return None
 
 
@@ -1069,13 +1074,23 @@ def generate_payment_voucher_pdf(payment):
         story.append(Paragraph(payment["notes"], s_small))
         story.append(Spacer(1, 10))
 
-    attach_notes = []
+    attach_lines = []
     if payment.get("receipt_path"):
-        attach_notes.append("✓ Receipt attached")
+        r_url = get_payment_file_url(payment["receipt_path"])
+        if r_url:
+            attach_lines.append(f'📎 <link href="{r_url}" color="#1A6B5A">View Receipt</link> (link valid 14 days)')
+        else:
+            attach_lines.append("📎 Receipt attached (link could not be generated — check in-app)")
     if payment.get("proof_of_payment_path"):
-        attach_notes.append("✓ Proof of payment attached")
-    if attach_notes:
-        story.append(Paragraph(" · ".join(attach_notes), s_small))
+        p_url = get_payment_file_url(payment["proof_of_payment_path"])
+        if p_url:
+            attach_lines.append(f'📎 <link href="{p_url}" color="#1A6B5A">View Proof of Payment</link> (link valid 14 days)')
+        else:
+            attach_lines.append("📎 Proof of payment attached (link could not be generated — check in-app)")
+    if attach_lines:
+        story.append(Paragraph("ATTACHMENTS", s_label))
+        for line in attach_lines:
+            story.append(Paragraph(line, s_small))
         story.append(Spacer(1, 10))
 
     # Signature lines
@@ -2889,12 +2904,15 @@ with tab8:
                 placeholder="Right-click folder → Share → Copy link")
             od_reports = st.text_input("📊 ULU Accountant Reports folder link", key="od_ulu_rpt",
                 placeholder="Right-click folder → Share → Copy link")
+            od_payments = st.text_input("💳 Payment Voucher Attachments folder link", key="od_ulu_payments",
+                placeholder="Right-click folder → Share → Copy link")
 
             if st.button("📱 Generate WhatsApp Message", key="gen_ulu_wa"):
                 links = ""
-                if od_reports: links += f"📊 *Financial Reports (Excel):*\n{od_reports}\n\n"
-                if od_mgr:     links += f"📋 *Manager Monthly Reports (Property Manager's Submissions):*\n{od_mgr}\n\n"
-                if od_capex:   links += f"📋 *CapEx Receipts & Invoices:*\n{od_capex}\n\n"
+                if od_reports:  links += f"📊 *Financial Reports (Excel):*\n{od_reports}\n\n"
+                if od_mgr:      links += f"📋 *Manager Monthly Reports (Property Manager's Submissions):*\n{od_mgr}\n\n"
+                if od_capex:    links += f"📋 *CapEx Receipts & Invoices:*\n{od_capex}\n\n"
+                if od_payments: links += f"💳 *Payment Vouchers, Receipts & Proof of Payment:*\n{od_payments}\n\n"
                 if not links:
                     st.warning("Please paste at least one link.")
                 else:
@@ -2985,7 +3003,7 @@ with tab8:
 1. Generate Excel report from this tab (now includes a Payments & Vouchers sheet)
 2. Share CapEx Receipts folder (all original invoices)
 3. Share ULU Accountant Reports folder
-4. Give access to the Payments & Vouchers tab, or send a payment summary from the "💳 Payment Vouchers" tab above, for full visibility on management fee and reimbursement payments
+4. Give access to the Payments & Vouchers tab, or share the Payment Voucher Attachments folder (see OneDrive Links above), for full visibility on management fee and reimbursement payments
 """)
     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -3000,8 +3018,8 @@ with tab9:
                "and Suppliers/Vendors, with receipt + proof-of-payment attachments and printable vouchers. "
                "Every record here is visible to whoever has access to this app, including the Accountant.")
 
-    pay_tab1, pay_tab2, pay_tab3 = st.tabs(
-        ["➕ Record Payment", "📋 All Payment Records", "🧾 Generate Voucher PDF"]
+    pay_tab1, pay_tab2, pay_tab3, pay_tab4 = st.tabs(
+        ["➕ Record Payment", "📋 All Payment Records", "🧾 Generate Voucher PDF", "🔄 Sync to Local Folder"]
     )
 
     PAYEE_TYPES = ["Property Manager (Reimbursable)", "Archmedia Sdn Bhd (Management Fee)", "Vendor / Supplier (Direct Expense)"]
@@ -3114,20 +3132,44 @@ with tab9:
             if not payee_name.strip():
                 st.warning("Please enter a payee name.")
             else:
-                receipt_path = upload_payment_file(receipt_file.read(), receipt_file.name, "receipt") if receipt_file else None
-                proof_path   = upload_payment_file(proof_file.read(), proof_file.name, "proof") if proof_file else None
+                receipt_bytes = receipt_file.read() if receipt_file else None
+                proof_bytes   = proof_file.read() if proof_file else None
 
-                conn = get_db()
-                conn.execute(
-                    """INSERT INTO payments
-                       (payment_date,payee_type,payee_name,payee_phone,category,source_table,source_id,description,
-                        amount_due,amount_paid,status,payment_method,reference_no,receipt_path,proof_of_payment_path,notes)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (str(payment_date_val), payee_type, payee_name, payee_phone, category, linked_source_table, linked_source_id,
-                     description, amount_due, amount_paid, status, payment_method, reference_no,
-                     receipt_path, proof_path, notes)
-                )
-                conn.commit(); conn.close()
+                receipt_path = upload_payment_file(receipt_bytes, receipt_file.name, "receipt") if receipt_bytes else None
+                proof_path   = upload_payment_file(proof_bytes, proof_file.name, "proof") if proof_bytes else None
+
+                # Insert directly via the Supabase client (bypassing the SQL-emulation layer
+                # here) so we get the new row's id back immediately — needed to name local
+                # files consistently with what the sync tool expects (PV-00001_receipt.ext).
+                sb = get_supabase()
+                insert_res = sb.table("payments").insert({
+                    "payment_date": str(payment_date_val), "payee_type": payee_type,
+                    "payee_name": payee_name, "payee_phone": payee_phone, "category": category,
+                    "source_table": linked_source_table, "source_id": linked_source_id,
+                    "description": description, "amount_due": amount_due, "amount_paid": amount_paid,
+                    "status": status, "payment_method": payment_method, "reference_no": reference_no,
+                    "receipt_path": receipt_path, "proof_of_payment_path": proof_path, "notes": notes,
+                }).execute()
+                new_id = insert_res.data[0]["id"] if insert_res.data else None
+
+                # Also save a local copy (synced via OneDrive) so the accountant can be given
+                # one persistent folder link, same pattern as CapEx Receipts. Only persists
+                # when running the local app — Streamlit Cloud's disk resets on redeploy.
+                if new_id and (receipt_bytes or proof_bytes):
+                    local_folder = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                 "Payment Voucher Attachments")
+                    os.makedirs(local_folder, exist_ok=True)
+                    if receipt_bytes:
+                        ext = Path(receipt_file.name).suffix or ".bin"
+                        fn = f"PV-{new_id:05d}_receipt{ext}"
+                        with open(os.path.join(local_folder, fn), "wb") as _f:
+                            _f.write(receipt_bytes)
+                    if proof_bytes:
+                        ext = Path(proof_file.name).suffix or ".bin"
+                        fn = f"PV-{new_id:05d}_proof{ext}"
+                        with open(os.path.join(local_folder, fn), "wb") as _f:
+                            _f.write(proof_bytes)
+
                 st.success("✅ Payment record saved.")
                 st.rerun()
 
@@ -3231,8 +3273,18 @@ with tab9:
             st.write(f"**Payee:** {v_row['payee_name']}  |  **Category:** {v_row['category']}  |  **Status:** {v_row['status']}")
 
             if st.button("🧾 Generate Voucher", key="gen_voucher_btn"):
-                st.session_state[f"voucher_pdf_{v_row['id']}"] = generate_payment_voucher_pdf(v_row)
+                pdf_bytes = generate_payment_voucher_pdf(v_row)
+                st.session_state[f"voucher_pdf_{v_row['id']}"] = pdf_bytes
                 st.session_state.pop(f"voucher_link_{v_row['id']}", None)  # any old link is now stale
+
+                # Save a local copy too (synced via OneDrive), same folder as receipts/proofs,
+                # so the accountant can be given one persistent folder link for everything.
+                local_folder = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                             "Payment Voucher Attachments")
+                os.makedirs(local_folder, exist_ok=True)
+                fn = f"Payment_Voucher_PV-{v_row['id']:05d}.pdf"
+                with open(os.path.join(local_folder, fn), "wb") as _f:
+                    _f.write(pdf_bytes)
 
             pdf_bytes = st.session_state.get(f"voucher_pdf_{v_row['id']}")
 
@@ -3293,6 +3345,60 @@ with tab9:
                         st.caption("No WhatsApp number saved for this payee — you'll pick the contact inside WhatsApp.")
                     st.text_area("Or copy this message manually:", value=wa_message, height=220,
                                  key=f"wa_msg_{v_row['id']}")
+
+    # ── SUB-TAB 4: SYNC TO LOCAL FOLDER ────────────────────────────────
+    with pay_tab4:
+        st.subheader("Sync Missing Attachments to Local Folder")
+        st.caption(
+            "If you recorded a payment while working remotely (cloud app, another device), "
+            "its receipt/proof of payment is safely stored in Supabase — but never reached "
+            "your Dell's local 'Payment Voucher Attachments' folder, since that only happens "
+            "when the app runs locally. Run this next time you're back on the Dell to catch up. "
+            "Scope note: this covers receipts and proof-of-payment only — generated voucher PDFs "
+            "aren't tracked for sync since they're created on demand, not stored persistently "
+            "unless you've used 'Create Shareable Link' for that specific voucher."
+        )
+
+        if st.button("🔄 Check & Sync Missing Attachments", key="sync_attachments_btn"):
+            conn = get_db()
+            all_rows = conn.execute("SELECT * FROM payments ORDER BY id").fetchall()
+            conn.close()
+
+            local_folder = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                         "Payment Voucher Attachments")
+            os.makedirs(local_folder, exist_ok=True)
+
+            sb = get_supabase()
+            synced, already_present, failed = [], [], []
+
+            for r in all_rows:
+                for path_field, kind in [("receipt_path", "receipt"), ("proof_of_payment_path", "proof")]:
+                    storage_path = r.get(path_field)
+                    if not storage_path:
+                        continue
+                    ext = Path(storage_path).suffix or ".bin"
+                    fn = f"PV-{r['id']:05d}_{kind}{ext}"
+                    local_path = os.path.join(local_folder, fn)
+                    if os.path.exists(local_path):
+                        already_present.append(fn)
+                        continue
+                    try:
+                        file_bytes = sb.storage.from_(PAYMENT_BUCKET).download(storage_path)
+                        with open(local_path, "wb") as _f:
+                            _f.write(file_bytes)
+                        synced.append(fn)
+                    except Exception as e:
+                        failed.append(f"{fn} — {e}")
+
+            if synced:
+                st.success(f"✅ Synced {len(synced)} file(s): " + ", ".join(synced))
+            if already_present:
+                st.caption(f"Already present locally: {len(already_present)} file(s) — skipped.")
+            if failed:
+                st.warning("Some files couldn't be synced:\n" + "\n".join(failed))
+            if not synced and not already_present and not failed:
+                st.info("No payment attachments found in the database yet.")
+
     st.markdown('</div>', unsafe_allow_html=True)
 
 
