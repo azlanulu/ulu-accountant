@@ -2781,6 +2781,7 @@ if import_mode == "true":
     st.warning("⚠️ Only import once! Importing again will create duplicate entries.")
 
 # ══════════════════════════════════════════════
+# ══════════════════════════════════════════════
 # TAB 9 — PAYMENTS & VOUCHERS
 # ══════════════════════════════════════════════
 PAYMENT_STATUSES = ["Pending", "Paid", "Partial", "Cancelled"]
@@ -2795,109 +2796,95 @@ PAYMENT_TYPES    = [
     "Contractor Payment",
     "Other",
 ]
-STATUS_ICONS = {
-    "Pending":   "🟡",
-    "Paid":      "🟢",
-    "Partial":   "🔵",
-    "Cancelled": "⚫",
-}
+STATUS_ICONS = {"Pending":"🟡","Paid":"🟢","Partial":"🔵","Cancelled":"⚫"}
 
 def generate_voucher_number(year, month):
     conn = get_db()
-    rows = conn.execute(
-        "SELECT id FROM payments WHERE year=? AND month=? ORDER BY id",
-        (year, month)
-    ).fetchall()
+    rows = conn.execute("SELECT id FROM payments WHERE year=? AND month=? ORDER BY id",(year,month)).fetchall()
     conn.close()
-    seq = len(rows) + 1
-    return f"PV-{year}-{month:02d}-{seq:03d}"
+    return f"PV-{year}-{month:02d}-{len(rows)+1:03d}"
 
 def generate_payment_voucher_pdf(payment: dict) -> bytes:
     buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=A4,
-        rightMargin=20*mm, leftMargin=20*mm,
-        topMargin=18*mm, bottomMargin=18*mm)
-    INK   = colors.HexColor("#1C1C1A")
-    GREEN = colors.HexColor("#2a3528")
-    LIGHT = colors.HexColor("#E5DDD0")
-    RED   = colors.HexColor("#CC0000")
-    W = A4[0] - 40*mm
-    sN  = ParagraphStyle("n",  fontName="Helvetica",      fontSize=10, leading=14, textColor=INK)
-    sB  = ParagraphStyle("b",  fontName="Helvetica-Bold", fontSize=10, leading=14, textColor=INK)
-    sS  = ParagraphStyle("s",  fontName="Helvetica",      fontSize=8,  leading=11, textColor=colors.HexColor("#6B6560"))
-    sT  = ParagraphStyle("t",  fontName="Helvetica-Bold", fontSize=18, leading=22, textColor=INK)
-    sSub= ParagraphStyle("su", fontName="Helvetica-Bold", fontSize=11, leading=14, textColor=GREEN)
-    sCan= ParagraphStyle("c",  fontName="Helvetica-Bold", fontSize=22, alignment=TA_CENTER, textColor=RED)
-    sCanR=ParagraphStyle("cr", fontName="Helvetica-Bold", fontSize=11, alignment=TA_CENTER, textColor=RED)
-    is_cancelled  = payment.get("status","") == "Cancelled"
+    doc = SimpleDocTemplate(buf,pagesize=A4,rightMargin=20*mm,leftMargin=20*mm,topMargin=18*mm,bottomMargin=18*mm)
+    INK=colors.HexColor("#1C1C1A"); GREEN=colors.HexColor("#2a3528"); LIGHT=colors.HexColor("#E5DDD0"); RED=colors.HexColor("#CC0000")
+    W=A4[0]-40*mm
+    sN =ParagraphStyle("n", fontName="Helvetica",     fontSize=10,leading=14,textColor=INK)
+    sB =ParagraphStyle("b", fontName="Helvetica-Bold",fontSize=10,leading=14,textColor=INK)
+    sS =ParagraphStyle("s", fontName="Helvetica",     fontSize=8, leading=11,textColor=colors.HexColor("#6B6560"))
+    sT =ParagraphStyle("t", fontName="Helvetica-Bold",fontSize=18,leading=22,textColor=INK)
+    sSub=ParagraphStyle("su",fontName="Helvetica-Bold",fontSize=11,leading=14,textColor=GREEN)
+    sCan=ParagraphStyle("c", fontName="Helvetica-Bold",fontSize=22,alignment=TA_CENTER,textColor=RED)
+    sCanR=ParagraphStyle("cr",fontName="Helvetica-Bold",fontSize=11,alignment=TA_CENTER,textColor=RED)
+    is_cancelled  = payment.get("status","")=="Cancelled"
     cancel_reason = payment.get("cancellation_reason","") or ""
-    story = []
-    story.append(Paragraph("ULU Mahsuri Villa", sT))
-    story.append(Paragraph("Payment Voucher", sSub))
-    story.append(HRFlowable(width="100%", thickness=2, color=GREEN, spaceAfter=10))
+    month_val=payment.get("month",1)
+    try: month_label=MONTHS[int(month_val)-1]
+    except: month_label=str(month_val)
+    payee  = payment.get("payee_name","") or payment.get("payee","") or "—"
+    ptype  = payment.get("payee_type","") or payment.get("payment_type","") or "—"
+    amount = float(payment.get("amount_due",0) or payment.get("amount",0) or 0)
+    ref    = payment.get("reference_no","") or payment.get("payment_ref","") or "—"
+    bank   = payment.get("payee_bank","") or "—"
+    acc    = payment.get("payee_account","") or "—"
+    voucher= payment.get("voucher_no","") or f"PMT-{payment.get('id','?')}"
+    pdate  = payment.get("payment_date","") or "—"
+    method = payment.get("payment_method","") or "—"
+    status = payment.get("status","") or "—"
+    desc   = payment.get("description","") or "—"
+    story=[]
+    story.append(Paragraph("ULU Mahsuri Villa",sT))
+    story.append(Paragraph("Payment Voucher",sSub))
+    story.append(HRFlowable(width="100%",thickness=2,color=GREEN,spaceAfter=10))
     if is_cancelled:
-        story.append(Paragraph("CANCELLED", sCan))
-        if cancel_reason:
-            story.append(Paragraph(f"Reason: {cancel_reason}", sCanR))
-        story.append(Spacer(1, 8))
-        story.append(HRFlowable(width="100%", thickness=1, color=RED, spaceAfter=8))
-    month_val = payment.get("month", 1)
-    try:
-        month_label = MONTHS[int(month_val)-1]
-    except:
-        month_label = str(month_val)
-    details = [
-        ["Voucher No.", payment.get("voucher_no","—"),   "Date",    payment.get("payment_date","—")],
-        ["Payee",       payment.get("payee","—"),         "Month",   f"{month_label} {payment.get('year','—')}"],
-        ["Type",        payment.get("payment_type","—"), "Method",  payment.get("payment_method","—")],
-        ["Bank",        payment.get("payee_bank","—"),   "Acc No.", payment.get("payee_account","—")],
-        ["Reference",   payment.get("payment_ref","—"),  "Status",  payment.get("status","—")],
+        story.append(Paragraph("CANCELLED",sCan))
+        if cancel_reason: story.append(Paragraph(f"Reason: {cancel_reason}",sCanR))
+        story.append(Spacer(1,8))
+        story.append(HRFlowable(width="100%",thickness=1,color=RED,spaceAfter=8))
+    details=[
+        ["Voucher No.",voucher,  "Date",   str(pdate)],
+        ["Payee",      payee,    "Month",  f"{month_label} {payment.get('year','—')}"],
+        ["Type",       ptype,    "Method", method],
+        ["Bank",       bank,     "Acc No.",acc],
+        ["Reference",  ref,      "Status", status],
     ]
-    det_tbl = Table(details, colWidths=[W*0.18, W*0.32, W*0.18, W*0.32])
+    det_tbl=Table(details,colWidths=[W*0.18,W*0.32,W*0.18,W*0.32])
     det_tbl.setStyle(TableStyle([
-        ("FONTNAME",(0,0),(-1,-1),"Helvetica"),
-        ("FONTNAME",(0,0),(0,-1),"Helvetica-Bold"),
-        ("FONTNAME",(2,0),(2,-1),"Helvetica-Bold"),
-        ("FONTSIZE",(0,0),(-1,-1),9),
-        ("TEXTCOLOR",(0,0),(-1,-1),INK),
-        ("TOPPADDING",(0,0),(-1,-1),5),
-        ("BOTTOMPADDING",(0,0),(-1,-1),5),
-        ("LINEBELOW",(0,0),(-1,-1),0.3,LIGHT),
+        ("FONTNAME",(0,0),(-1,-1),"Helvetica"),("FONTNAME",(0,0),(0,-1),"Helvetica-Bold"),
+        ("FONTNAME",(2,0),(2,-1),"Helvetica-Bold"),("FONTSIZE",(0,0),(-1,-1),9),
+        ("TEXTCOLOR",(0,0),(-1,-1),INK),("TOPPADDING",(0,0),(-1,-1),5),
+        ("BOTTOMPADDING",(0,0),(-1,-1),5),("LINEBELOW",(0,0),(-1,-1),0.3,LIGHT),
     ]))
-    story.append(det_tbl)
-    story.append(Spacer(1, 12))
-    story.append(Paragraph("Description / Purpose:", sB))
-    story.append(Paragraph(payment.get("description","—") or "—", sN))
-    story.append(Spacer(1, 12))
-    bg_col = colors.HexColor("#888") if is_cancelled else GREEN
-    amt_tbl = Table(
-        [["Amount (MYR)", f"RM {float(payment.get('amount',0) or 0):,.2f}"]],
-        colWidths=[W*0.6, W*0.4]
-    )
+    story.append(det_tbl); story.append(Spacer(1,12))
+    story.append(Paragraph("Description / Purpose:",sB)); story.append(Paragraph(desc,sN)); story.append(Spacer(1,12))
+    bg_col=colors.HexColor("#888") if is_cancelled else GREEN
+    amt_tbl=Table([["Amount (MYR)",f"RM {amount:,.2f}"]],colWidths=[W*0.6,W*0.4])
     amt_tbl.setStyle(TableStyle([
-        ("BACKGROUND",(0,0),(-1,-1),bg_col),
-        ("TEXTCOLOR",(0,0),(-1,-1),colors.white),
-        ("FONTNAME",(0,0),(-1,-1),"Helvetica-Bold"),
-        ("FONTSIZE",(0,0),(-1,-1),13),
-        ("ALIGN",(1,0),(1,0),"RIGHT"),
-        ("TOPPADDING",(0,0),(-1,-1),10),
-        ("BOTTOMPADDING",(0,0),(-1,-1),10),
-        ("LEFTPADDING",(0,0),(-1,-1),12),
-        ("RIGHTPADDING",(0,0),(-1,-1),12),
+        ("BACKGROUND",(0,0),(-1,-1),bg_col),("TEXTCOLOR",(0,0),(-1,-1),colors.white),
+        ("FONTNAME",(0,0),(-1,-1),"Helvetica-Bold"),("FONTSIZE",(0,0),(-1,-1),13),
+        ("ALIGN",(1,0),(1,0),"RIGHT"),("TOPPADDING",(0,0),(-1,-1),10),
+        ("BOTTOMPADDING",(0,0),(-1,-1),10),("LEFTPADDING",(0,0),(-1,-1),12),("RIGHTPADDING",(0,0),(-1,-1),12),
     ]))
     story.append(amt_tbl)
     if is_cancelled and cancel_reason:
-        story.append(Spacer(1, 6))
-        story.append(Paragraph(f"Cancellation reason: {cancel_reason}", sCanR))
-    story.append(Spacer(1, 16))
-    story.append(HRFlowable(width="100%", thickness=0.5, color=LIGHT, spaceAfter=8))
-    story.append(Paragraph(
-        f"ULU Mahsuri Villa · Generated {datetime.datetime.now().strftime('%d %B %Y %H:%M')}",
-        sS
-    ))
-    doc.build(story)
-    buf.seek(0)
-    return buf.getvalue()
+        story.append(Spacer(1,6)); story.append(Paragraph(f"Cancellation reason: {cancel_reason}",sCanR))
+    story.append(Spacer(1,16))
+    story.append(HRFlowable(width="100%",thickness=0.5,color=LIGHT,spaceAfter=8))
+    story.append(Paragraph(f"ULU Mahsuri Villa · Generated {datetime.datetime.now().strftime('%d %B %Y %H:%M')}",sS))
+    doc.build(story); buf.seek(0); return buf.getvalue()
+
+def pv_year_val(r):
+    y=r.get("year")
+    if y: return int(y)
+    ca=str(r.get("created_at",""))
+    return int(ca[:4]) if len(ca)>=4 else 0
+
+def pv_month_val(r):
+    m=r.get("month")
+    if m: return int(m)
+    ca=str(r.get("created_at",""))
+    try: return int(ca[5:7])
+    except: return 0
 
 with tab9:
     st.markdown('<div class="card">', unsafe_allow_html=True)
@@ -2909,31 +2896,26 @@ with tab9:
     with pv_subtab1:
         ym_list_pv = get_year_month_list()
         ym_labels_pv = [f"{MONTHS[m-1]} {y} ({operation_year(y,m)})" for y,m in ym_list_pv]
-        sel_idx_pv = st.selectbox(
-            "Assign payment to month",
-            range(len(ym_labels_pv)),
-            format_func=lambda i: ym_labels_pv[i],
-            key="pv_month"
-        )
+        sel_idx_pv = st.selectbox("Assign payment to month", range(len(ym_labels_pv)),
+            format_func=lambda i: ym_labels_pv[i], key="pv_month")
         pv_year, pv_month = ym_list_pv[sel_idx_pv]
 
         col_a, col_b = st.columns(2, gap="large")
         with col_a:
-            pv_payee      = st.text_input("Payee Name", placeholder="e.g. Archmedia Sdn Bhd / Qasim Bin Ismail", key="pv_payee")
-            pv_type       = st.selectbox("Payment Type", PAYMENT_TYPES, key="pv_type")
-            pv_desc       = st.text_area("Description / Purpose", height=80,
-                                placeholder="e.g. Property Management Fee for June 2026", key="pv_desc")
-            pv_amount     = st.number_input("Amount (RM)", min_value=0.0, step=10.0, format="%.2f", key="pv_amount")
-            pv_date       = st.text_input("Payment Date (YYYY-MM-DD)",
-                                value=datetime.date.today().isoformat(), key="pv_date")
+            pv_payee  = st.text_input("Payee Name", placeholder="e.g. Archmedia Sdn Bhd", key="pv_payee")
+            pv_type   = st.selectbox("Payment Type", PAYMENT_TYPES, key="pv_type")
+            pv_desc   = st.text_area("Description / Purpose", height=80, key="pv_desc",
+                            placeholder="e.g. Property Management Fee for June 2026")
+            pv_amount = st.number_input("Amount (RM)", min_value=0.0, step=10.0, format="%.2f", key="pv_amount")
+            pv_date   = st.text_input("Payment Date (YYYY-MM-DD)", value=datetime.date.today().isoformat(), key="pv_date")
         with col_b:
-            pv_method     = st.selectbox("Payment Method",
+            pv_method = st.selectbox("Payment Method",
                 ["Bank Transfer","Cash","Cheque","Online Banking","Other"], key="pv_method")
-            pv_ref        = st.text_input("Payment Reference / Transaction ID",
-                                placeholder="e.g. IBG20260705001", key="pv_ref")
-            pv_payee_bank = st.text_input("Payee Bank", placeholder="e.g. Maybank / CIMB / RHB", key="pv_bank")
-            pv_payee_acc  = st.text_input("Payee Account No.", placeholder="e.g. 1234567890", key="pv_acc")
-            pv_notes      = st.text_area("Notes", height=60, key="pv_notes")
+            pv_ref    = st.text_input("Payment Reference / Transaction ID",
+                            placeholder="e.g. IBG20260705001", key="pv_ref")
+            pv_bank   = st.text_input("Payee Bank", placeholder="e.g. Maybank / CIMB / RHB", key="pv_bank")
+            pv_acc    = st.text_input("Payee Account No.", placeholder="e.g. 1234567890", key="pv_acc")
+            pv_notes  = st.text_area("Notes", height=60, key="pv_notes")
 
         if st.button("💾 Save Payment & Generate Voucher", type="primary", key="btn_save_pv"):
             if not pv_payee or pv_amount <= 0:
@@ -2943,31 +2925,25 @@ with tab9:
                 conn = get_db()
                 conn.execute(
                     """INSERT INTO payments
-                       (year,month,voucher_no,payee,payment_type,description,amount,
-                        payment_date,payment_method,payment_ref,payee_bank,payee_account,
+                       (year,month,voucher_no,payee_name,payee_type,description,amount_due,
+                        payment_date,payment_method,reference_no,payee_bank,payee_account,
                         notes,status)
                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (pv_year, pv_month, voucher_no, pv_payee, pv_type, pv_desc,
-                     pv_amount, pv_date, pv_method, pv_ref, pv_payee_bank,
-                     pv_payee_acc, pv_notes, "Pending")
+                    (pv_year,pv_month,voucher_no,pv_payee,pv_type,pv_desc,
+                     pv_amount,pv_date,pv_method,pv_ref,pv_bank,pv_acc,pv_notes,"Pending")
                 )
                 conn.commit(); conn.close()
-                payment_dict = {
-                    "voucher_no": voucher_no, "year": pv_year, "month": pv_month,
-                    "payee": pv_payee, "payment_type": pv_type, "description": pv_desc,
-                    "amount": pv_amount, "payment_date": pv_date, "payment_method": pv_method,
-                    "payment_ref": pv_ref, "payee_bank": pv_payee_bank,
-                    "payee_account": pv_payee_acc, "status": "Pending", "cancellation_reason": ""
+                pd_dict = {
+                    "voucher_no":voucher_no,"year":pv_year,"month":pv_month,
+                    "payee_name":pv_payee,"payee_type":pv_type,"description":pv_desc,
+                    "amount_due":pv_amount,"payment_date":pv_date,"payment_method":pv_method,
+                    "reference_no":pv_ref,"payee_bank":pv_bank,"payee_account":pv_acc,
+                    "status":"Pending","cancellation_reason":""
                 }
-                pdf_bytes = generate_payment_voucher_pdf(payment_dict)
+                pdf_bytes = generate_payment_voucher_pdf(pd_dict)
                 st.success(f"Payment saved. Voucher: **{voucher_no}**")
-                st.download_button(
-                    f"Download {voucher_no}.pdf",
-                    data=pdf_bytes,
-                    file_name=f"{voucher_no}.pdf",
-                    mime="application/pdf",
-                    key=f"dl_new_{voucher_no}"
-                )
+                st.download_button(f"⬇️ Download {voucher_no}.pdf", data=pdf_bytes,
+                    file_name=f"{voucher_no}.pdf", mime="application/pdf", key=f"dl_new_{voucher_no}")
                 st.rerun()
 
     with pv_subtab2:
@@ -2977,29 +2953,23 @@ with tab9:
         filter_status = pf3.selectbox("Status", ["All"] + PAYMENT_STATUSES, key="pv_filter_st")
 
         conn = get_db()
-        if filter_month == "All":
-            pv_rows = conn.execute(
-                "SELECT * FROM payments WHERE year=? ORDER BY month DESC, id DESC",
-                (filter_year,)
-            ).fetchall()
-        else:
-            mo_num = MONTHS.index(filter_month) + 1
-            pv_rows = conn.execute(
-                "SELECT * FROM payments WHERE year=? AND month=? ORDER BY id DESC",
-                (filter_year, mo_num)
-            ).fetchall()
+        all_pv = conn.execute("SELECT * FROM payments ORDER BY id DESC", ()).fetchall()
         conn.close()
 
+        pv_rows = [r for r in all_pv if pv_year_val(r) == filter_year]
+        if filter_month != "All":
+            mo_num = MONTHS.index(filter_month) + 1
+            pv_rows = [r for r in pv_rows if pv_month_val(r) == mo_num]
         if filter_status != "All":
             pv_rows = [r for r in pv_rows if r.get("status","") == filter_status]
 
-        active_rows   = [r for r in pv_rows if r.get("status","") != "Cancelled"]
-        total_amount  = sum(float(r.get("amount",0) or 0) for r in active_rows)
-        paid_rows     = [r for r in active_rows if r.get("status","") == "Paid"]
-        total_paid    = sum(float(r.get("amount",0) or 0) for r in paid_rows)
-        total_pending = total_amount - total_paid
+        active_rows  = [r for r in pv_rows if r.get("status","") != "Cancelled"]
+        total_amount = sum(float(r.get("amount_due",0) or 0) for r in active_rows)
+        paid_rows    = [r for r in active_rows if r.get("status","") == "Paid"]
+        total_paid   = sum(float(r.get("amount_due",0) or 0) for r in paid_rows)
+        total_pending= total_amount - total_paid
 
-        mc1, mc2, mc3, mc4 = st.columns(4)
+        mc1,mc2,mc3,mc4 = st.columns(4)
         mc1.metric("Total Records", len(pv_rows))
         mc2.metric("Total Due (excl. cancelled)", fmt_myr(total_amount))
         mc3.metric("Total Paid", fmt_myr(total_paid))
@@ -3011,84 +2981,70 @@ with tab9:
         else:
             for r in [dict(r) for r in pv_rows]:
                 r_id        = r.get("id")
-                r_status    = r.get("status","Pending")
-                r_icon      = STATUS_ICONS.get(r_status, "⚪")
+                r_status    = r.get("status","Pending") or "Pending"
+                r_icon      = STATUS_ICONS.get(r_status,"⚪")
                 is_canc     = r_status == "Cancelled"
                 canc_reason = r.get("cancellation_reason","") or ""
+                payee_disp  = r.get("payee_name","") or r.get("payee","") or "—"
+                amount_disp = float(r.get("amount_due",0) or 0)
+                voucher_disp= r.get("voucher_no","") or f"PMT-{r_id}"
+                mo_d = pv_month_val(r); yr_d = pv_year_val(r)
 
-                header_label = f"{r_icon} **{r.get('voucher_no','—')}** — {r.get('payee','—')} — {fmt_myr(r.get('amount',0))}"
-                if is_canc:
-                    header_label += " *(Cancelled)*"
+                header_label = f"{r_icon} **{voucher_disp}** — {payee_disp} — {fmt_myr(amount_disp)}"
+                if is_canc: header_label += " *(Cancelled)*"
 
                 with st.expander(header_label, expanded=False):
                     if is_canc and canc_reason:
                         st.warning(f"🚫 Cancelled — Reason: {canc_reason}")
 
-                    d1, d2, d3 = st.columns(3)
+                    d1,d2,d3 = st.columns(3)
                     d1.markdown(f"**Date:** {r.get('payment_date','—')}")
-                    d2.markdown(f"**Month:** {MONTHS[int(r.get('month',1))-1]} {r.get('year','—')}")
-                    d3.markdown(f"**Type:** {r.get('payment_type','—')}")
-                    d4, d5, d6 = st.columns(3)
+                    d2.markdown(f"**Month:** {MONTHS[mo_d-1] if mo_d else '—'} {yr_d or '—'}")
+                    d3.markdown(f"**Type:** {r.get('payee_type','') or r.get('payment_type','') or '—'}")
+                    d4,d5,d6 = st.columns(3)
                     d4.markdown(f"**Method:** {r.get('payment_method','—')}")
-                    d5.markdown(f"**Ref:** {r.get('payment_ref','—')}")
+                    d5.markdown(f"**Ref:** {r.get('reference_no','') or r.get('payment_ref','') or '—'}")
                     d6.markdown(f"**Bank:** {r.get('payee_bank','—')} / {r.get('payee_account','—')}")
                     st.markdown(f"**Description:** {r.get('description','—')}")
-                    if r.get("notes"):
-                        st.markdown(f"**Notes:** {r.get('notes','')}")
+                    if r.get("notes"): st.markdown(f"**Notes:** {r.get('notes','')}")
 
                     st.divider()
-                    act1, act2, act3, act4 = st.columns([2, 1, 2, 2])
+                    act1,act2,act3,act4 = st.columns([2,1,2,2])
 
                     if not is_canc:
-                        new_status = act1.selectbox(
-                            "Status",
-                            [s for s in PAYMENT_STATUSES if s != "Cancelled"],
-                            index=[s for s in PAYMENT_STATUSES if s != "Cancelled"].index(r_status)
-                            if r_status in PAYMENT_STATUSES and r_status != "Cancelled" else 0,
-                            key=f"pv_status_{r_id}",
-                            label_visibility="collapsed"
-                        )
+                        safe_statuses = [s for s in PAYMENT_STATUSES if s != "Cancelled"]
+                        cur_idx = safe_statuses.index(r_status) if r_status in safe_statuses else 0
+                        new_status = act1.selectbox("Status", safe_statuses, index=cur_idx,
+                            key=f"pv_status_{r_id}", label_visibility="collapsed")
                         if act2.button("Update", key=f"pv_upd_{r_id}"):
                             conn = get_db()
-                            conn.execute("UPDATE payments SET status=? WHERE id=?",
-                                         (new_status, r_id))
-                            conn.commit(); conn.close()
-                            st.rerun()
+                            conn.execute("UPDATE payments SET status=? WHERE id=?",(new_status,r_id))
+                            conn.commit(); conn.close(); st.rerun()
                     else:
                         act1.markdown("<span class='badge-cancelled'>⚫ Cancelled</span>", unsafe_allow_html=True)
 
-                    # Download voucher PDF
                     pdf_bytes = generate_payment_voucher_pdf(r)
                     suffix = "_CANCELLED" if is_canc else ""
-                    act3.download_button(
-                        "⬇️ Voucher PDF",
-                        data=pdf_bytes,
-                        file_name=f"{r.get('voucher_no','voucher')}{suffix}.pdf",
-                        mime="application/pdf",
-                        key=f"dl_pv_{r_id}"
-                    )
+                    act3.download_button("⬇️ Voucher PDF", data=pdf_bytes,
+                        file_name=f"{voucher_disp}{suffix}.pdf", mime="application/pdf",
+                        key=f"dl_pv_{r_id}")
 
-                    # Cancel / Delete buttons
                     if not is_canc:
                         if act4.button("🚫 Cancel Record", key=f"pv_cancel_btn_{r_id}"):
                             st.session_state[f"show_cancel_{r_id}"] = True
                     else:
                         if act4.button("🗑️ Delete", key=f"pv_del_{r_id}"):
                             conn = get_db()
-                            conn.execute("DELETE FROM payments WHERE id=?", (r_id,))
-                            conn.commit(); conn.close()
-                            st.rerun()
+                            conn.execute("DELETE FROM payments WHERE id=?",(r_id,))
+                            conn.commit(); conn.close(); st.rerun()
 
-                    # Cancel flow
                     if st.session_state.get(f"show_cancel_{r_id}"):
                         st.markdown("---")
                         st.error("**Cancel this payment record — this cannot be undone.**")
-                        cancel_input = st.text_input(
-                            "Reason for cancellation (required)",
+                        cancel_input = st.text_input("Reason for cancellation (required)",
                             key=f"cancel_reason_{r_id}",
-                            placeholder="e.g. Duplicate entry / Wrong amount / Payment reversed"
-                        )
-                        cc1, cc2 = st.columns(2)
+                            placeholder="e.g. Duplicate entry / Wrong amount / Payment reversed")
+                        cc1,cc2 = st.columns(2)
                         if cc1.button("Confirm Cancellation", key=f"cancel_confirm_{r_id}", type="primary"):
                             if not cancel_input.strip():
                                 st.error("A reason is required before confirming cancellation.")
@@ -3103,7 +3059,6 @@ with tab9:
                                 st.success("Record cancelled and reason recorded.")
                                 st.rerun()
                         if cc2.button("Back", key=f"cancel_back_{r_id}"):
-                            st.session_state.pop(f"show_cancel_{r_id}", None)
-                            st.rerun()
+                            st.session_state.pop(f"show_cancel_{r_id}", None); st.rerun()
 
     st.markdown('</div>', unsafe_allow_html=True)
