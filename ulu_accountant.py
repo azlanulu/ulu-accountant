@@ -10,7 +10,6 @@ import base64
 import json
 import datetime
 import io
-import urllib.parse
 from pathlib import Path
 
 import pandas as pd
@@ -232,31 +231,55 @@ class SupabaseCursor:
         table = self._table_from_sql(sql)
         if not table:
             return
-        set_match  = re.search(r'SET\s+(.+?)\s+WHERE', sql, re.IGNORECASE | re.DOTALL)
-        where_match= re.search(r'WHERE\s+(.+?)$', sql, re.IGNORECASE | re.DOTALL)
+        set_match   = re.search(r'SET\s+(.+?)\s+WHERE', sql, re.IGNORECASE | re.DOTALL)
+        where_match = re.search(r'WHERE\s+(.+?)$',      sql, re.IGNORECASE | re.DOTALL)
         if not set_match:
             return
         set_clause   = set_match.group(1).strip()
-        set_cols     = [s.strip().split('=')[0].strip() for s in set_clause.split(',')]
         where_clause = where_match.group(1).strip() if where_match else ""
 
-        n_set = len(set_cols)
-        set_vals   = p[:n_set]
-        where_vals = p[n_set:]
+        # ── Parse SET clause carefully ────────────────────────────────────────
+        # Each assignment is either:
+        #   col = ?           → consume next positional param
+        #   col = 'literal'   → use the literal value directly (no param consumed)
+        # A naive len(set_cols) count breaks when literals are present.
+        record = {}
+        param_idx = 0
+        for assignment in set_clause.split(','):
+            assignment = assignment.strip()
+            # col = 'literal string'
+            lit_match = re.match(r"(\w+)\s*=\s*'([^']*)'", assignment)
+            if lit_match:
+                record[lit_match.group(1)] = lit_match.group(2)
+                continue
+            # col = NULL
+            null_match = re.match(r"(\w+)\s*=\s*NULL", assignment, re.IGNORECASE)
+            if null_match:
+                record[null_match.group(1)] = None
+                continue
+            # col = ?  → consume next param
+            placeholder_match = re.match(r"(\w+)\s*=\s*\?", assignment)
+            if placeholder_match:
+                col = placeholder_match.group(1)
+                record[col] = p[param_idx] if param_idx < len(p) else None
+                param_idx += 1
+                continue
 
-        record = {col: set_vals[i] for i, col in enumerate(set_cols)}
+        where_vals = list(p[param_idx:])
+
         q = self.sb.table(table).update(record)
 
         # Apply WHERE
         if where_vals and 'id' in where_clause.lower():
             q = q.eq('id', where_vals[0])
         elif where_vals and where_clause:
-            # Parse simple year/month conditions
             conditions = re.split(r'\s+AND\s+', where_clause, flags=re.IGNORECASE)
-            for i, cond in enumerate(conditions):
+            widx = 0
+            for cond in conditions:
                 col_match = re.match(r'(\w+)\s*=\s*\?', cond.strip(), re.IGNORECASE)
-                if col_match and i < len(where_vals):
-                    q = q.eq(col_match.group(1), where_vals[i])
+                if col_match and widx < len(where_vals):
+                    q = q.eq(col_match.group(1), where_vals[widx])
+                    widx += 1
         q.execute()
 
     def _handle_delete(self, sql, p):
@@ -281,13 +304,7 @@ class SupabaseCursor:
         q.execute()
 
     def fetchone(self):
-        if self._rows:
-            return self._rows[0]
-        # Return an empty row instead of None so callers doing
-        # fetchone()["col"] get a clear KeyError (or 0 via .get) rather
-        # than crashing with "'NoneType' object is not subscriptable" —
-        # much easier to diagnose when a query fails silently.
-        return SupabaseRow({})
+        return self._rows[0] if self._rows else None
 
     def fetchall(self):
         return self._rows
@@ -325,15 +342,58 @@ st.markdown("""
 
   .stApp { background-color: #F5F0E8; }
 
-  .app-header {
+  /* ── Header: ID-anchored so no global span rule can override it ── */
+  #ulu-header, #ulu-header * {
+    color: #F5F0E8 !important;
+  }
+  #ulu-header {
     background: linear-gradient(135deg, #2a3528 0%, #1a2418 100%);
-    color: #F5F0E8;
     padding: 28px 36px 22px 36px;
     border-radius: 12px;
     margin-bottom: 24px;
   }
-  .app-header h1 { font-family:'DM Serif Display',serif; font-size:2rem; margin:0 0 4px 0; color:#F5F0E8; }
-  .app-header p  { margin:0; color:#A8B8A5; font-size:0.85rem; letter-spacing:0.05em; text-transform:uppercase; }
+  #ulu-header h1 {
+    font-family:'DM Serif Display',serif;
+    font-size:2rem; margin:0 0 4px 0;
+    color:#F5F0E8 !important;
+  }
+  #ulu-header p {
+    margin:0; color:#A8B8A5 !important;
+    font-size:0.85rem; letter-spacing:0.05em; text-transform:uppercase;
+  }
+
+  /* ── Global contrast & font-size fixes ── */
+  /* Body text, markdown, labels */
+  [class*="css"] p, [class*="css"] li,
+  .stMarkdown p, .stMarkdown li,
+  label, .stTextInput label, .stSelectbox label,
+  .stNumberInput label, .stTextArea label,
+  .stDateInput label, .stFileUploader label {
+    color: #1C1C1A !important;
+    font-size: 1rem !important;
+  }
+  /* Input/textarea field values */
+  input, textarea,
+  .stTextInput input, .stTextArea textarea,
+  .stNumberInput input {
+    color: #1C1C1A !important;
+    font-size: 1rem !important;
+  }
+  /* Selectbox displayed value */
+  [data-baseweb="select"] [data-baseweb="tag"],
+  [data-baseweb="select"] div[class*="singleValue"],
+  [data-baseweb="select"] div[class*="placeholder"] {
+    color: #1C1C1A !important;
+    font-size: 1rem !important;
+  }
+  /* Dropdown portal menu items — rendered outside normal DOM */
+  [data-baseweb="popover"] li,
+  [data-baseweb="menu"] li,
+  [data-baseweb="list-item"],
+  ul[data-baseweb="menu"] span {
+    color: #1C1C1A !important;
+    font-size: 1rem !important;
+  }
 
   .card {
     background:#FFFFFF;
@@ -385,6 +445,12 @@ st.markdown("""
   .badge-mbed  { background:#C4856A; color:white; padding:2px 10px; border-radius:12px; font-size:0.75rem; }
   .badge-airbnb  { background:#FF5A5F; color:white; padding:2px 8px; border-radius:10px; font-size:0.72rem; }
   .badge-direct  { background:#2a3528; color:white; padding:2px 8px; border-radius:10px; font-size:0.72rem; }
+
+  /* Payment voucher status badges */
+  .badge-paid     { background:#2a7a2a; color:white; padding:2px 10px; border-radius:12px; font-size:0.8rem; font-weight:600; }
+  .badge-pending  { background:#b8860b; color:white; padding:2px 10px; border-radius:12px; font-size:0.8rem; font-weight:600; }
+  .badge-partial  { background:#4a90d9; color:white; padding:2px 10px; border-radius:12px; font-size:0.8rem; font-weight:600; }
+  .badge-cancelled{ background:#555; color:white; padding:2px 10px; border-radius:12px; font-size:0.8rem; font-weight:600; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -417,7 +483,7 @@ OPEX_CATEGORIES = [
     "Marketing",
     "Insurance",
     "Assessment / Quit Rent",
-    "Management Fee (Archmedia)",
+    "Property Management Fee (Archmedia)",
     "Miscellaneous OpEx",
 ]
 
@@ -445,13 +511,10 @@ def get_setting(key):
     return r["value"] if r else None
 
 def set_setting(key, value):
-    # NOTE: bypasses the SQL adapter and calls Supabase directly. The adapter's
-    # regex-based INSERT parser requires an explicit "(cols) VALUES (...)" form;
-    # "INSERT OR REPLACE INTO settings VALUES (?,?)" has no column list, so it
-    # was silently failing to write on the cloud version. upsert() also correctly
-    # handles both the create and update case on the "key" primary key.
-    sb = get_supabase()
-    sb.table("settings").upsert({"key": key, "value": str(value)}, on_conflict="key").execute()
+    conn = get_db()
+    conn.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, str(value)))
+    conn.commit()
+    conn.close()
 
 def get_year_month_list():
     """Return list of (year, month) tuples from operation start to now."""
@@ -607,11 +670,11 @@ Rules: total_amount is a plain number, no RM symbol."""
         return json.loads(raw)
 
 # ─────────────────────────────────────────────
-# AI EXTRACTION — PROPERTY MANAGER'S MONTHLY BILLING REPORT
+# AI EXTRACTION — AZARY'S MONTHLY BILLING REPORT
 # ─────────────────────────────────────────────
 def extract_manager_report(file_bytes, file_name, api_key):
     """
-    Extract full structured data from the Property Manager's monthly billing report.
+    Extract full structured data from Azary's monthly billing report.
     Returns dict with bookings list, expenses list, and summary figures.
     """
     import anthropic as _ant
@@ -733,52 +796,6 @@ def save_manager_scan_file(file_bytes, file_name, year, month):
 
 
 # ─────────────────────────────────────────────
-# PAYMENT ATTACHMENT STORAGE (Supabase Storage)
-# Unlike scan_path above, these files must actually survive on the cloud
-# deployment (receipts + proof of payment are the audit trail), so they
-# are uploaded to a private Supabase Storage bucket rather than local disk.
-# Create the bucket once in Supabase: Storage → New bucket → "payment-attachments" (private).
-# ─────────────────────────────────────────────
-PAYMENT_BUCKET = "payment-attachments"
-
-def upload_payment_file(file_bytes, file_name, kind):
-    """Upload a receipt / proof-of-payment file to Supabase Storage.
-    kind: 'receipt' or 'proof' — used to namespace the storage path.
-    Returns the storage path (to store in the DB) or None on failure."""
-    if not file_bytes:
-        return None
-    sb = get_supabase()
-    ext = Path(file_name).suffix.lower() or ".bin"
-    safe_name = f"{datetime.datetime.now().strftime('%Y%m%d%H%M%S%f')}{ext}"
-    storage_path = f"{kind}/{safe_name}"
-    try:
-        sb.storage.from_(PAYMENT_BUCKET).upload(
-            storage_path, file_bytes,
-            file_options={"content-type": "application/octet-stream"}
-        )
-        return storage_path
-    except Exception as e:
-        st.error(f"Attachment upload failed: {e}")
-        return None
-
-def get_payment_file_url(storage_path, expires_in=1209600):
-    """Return a temporary signed URL to view/download a stored attachment.
-    Default expiry is 14 days to match what's promised in the WhatsApp share message."""
-    if not storage_path:
-        return None
-    sb = get_supabase()
-    try:
-        res = sb.storage.from_(PAYMENT_BUCKET).create_signed_url(storage_path, expires_in)
-        url = res.get("signedURL") or res.get("signed_url") or res.get("signedUrl")
-        if not url:
-            st.warning(f"Signed URL request for '{storage_path}' succeeded but returned no URL. Response: {res}")
-        return url
-    except Exception as e:
-        st.warning(f"Couldn't generate a link for '{storage_path}': {e}")
-        return None
-
-
-# ─────────────────────────────────────────────
 # PDF MONTHLY REPORT
 # ─────────────────────────────────────────────
 def generate_monthly_report(year, month, summary, bookings, mgr_expenses, personal_expenses):
@@ -827,7 +844,7 @@ def generate_monthly_report(year, month, summary, bookings, mgr_expenses, person
         box_row("Personal Expenses (ULU Share)", f"({fmt_myr(summary['personal_expenses'])})"),
         box_row("Gross Operating Cost", f"({fmt_myr(summary['gross_op_cost'])})"),
         box_row("Net Profit Before Sharing", fmt_myr(summary["net_before_sharing"])),
-        box_row(f"Management Fee ({summary['cohost_pct']:.0f}%)", f"({fmt_myr(summary['cohost_share'])})"),
+        box_row(f"Co-Host Share ({summary['cohost_pct']:.0f}%)", f"({fmt_myr(summary['cohost_share'])})"),
         box_row("Owner Net Profit (Your Income)", fmt_myr(summary["owner_share"]), highlight=True),
     ]
     sum_tbl = Table(summary_data, colWidths=[W*0.65, W*0.35])
@@ -954,177 +971,14 @@ def generate_monthly_report(year, month, summary, bookings, mgr_expenses, person
     return buffer.getvalue()
 
 
-# ─────────────────────────────────────────────
-# PDF PAYMENT VOUCHER
-# ─────────────────────────────────────────────
-def generate_payment_voucher_pdf(payment):
-    """Generate a one-page payment voucher PDF for a single payments row."""
-    buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=A4,
-                            rightMargin=20*mm, leftMargin=20*mm,
-                            topMargin=18*mm, bottomMargin=18*mm)
-
-    INK    = colors.HexColor("#1C1C1A")
-    GREEN  = colors.HexColor("#2a3528")
-    ACCENT = colors.HexColor("#C4856A")
-    LIGHT  = colors.HexColor("#E5DDD0")
-    GREY   = colors.HexColor("#6B6560")
-
-    s_normal = ParagraphStyle("n", fontName="Helvetica", fontSize=9.5, leading=14, textColor=INK)
-    s_small  = ParagraphStyle("s", fontName="Helvetica", fontSize=8, leading=12, textColor=GREY)
-    s_bold   = ParagraphStyle("b", fontName="Helvetica-Bold", fontSize=9.5, leading=14, textColor=INK)
-    s_title  = ParagraphStyle("t", fontName="Helvetica-Bold", fontSize=18, leading=22, textColor=INK)
-    s_sub    = ParagraphStyle("su", fontName="Helvetica-Bold", fontSize=11, leading=14, textColor=GREEN)
-    s_label  = ParagraphStyle("l", fontName="Helvetica", fontSize=7.5, textColor=GREY, spaceAfter=1)
-    s_status = ParagraphStyle("st", fontName="Helvetica-Bold", fontSize=11, textColor=colors.white, alignment=TA_CENTER)
-
-    story = []
-
-    company_name = get_setting("archmedia_company_name") or "Archmedia Sdn Bhd"
-    company_reg  = get_setting("archmedia_reg_no") or ""
-    company_addr = get_setting("archmedia_address") or ""
-
-    # Header
-    hdr_tbl = Table([[
-        Paragraph("PAYMENT VOUCHER", s_title),
-        Paragraph(f"Voucher No. PV-{payment['id']:05d}", s_bold),
-    ]], colWidths=[110*mm, 60*mm])
-    hdr_tbl.setStyle(TableStyle([
-        ("VALIGN",(0,0),(-1,-1),"MIDDLE"),
-        ("ALIGN",(1,0),(1,0),"RIGHT"),
-    ]))
-    story.append(hdr_tbl)
-    story.append(Spacer(1, 4))
-    story.append(Paragraph("ULU Mahsuri Villa · Operations Accountant", s_small))
-    story.append(Spacer(1, 10))
-    story.append(HRFlowable(width="100%", thickness=1, color=GREEN, spaceAfter=12))
-
-    # Issuer / status row
-    status_colors = {"Paid": colors.HexColor("#4a5e47"), "Partial": ACCENT, "Pending": colors.HexColor("#B0413E")}
-    status_bg = status_colors.get(payment.get("status","Pending"), GREY)
-
-    issuer_block = [
-        Paragraph("ISSUED BY", s_label),
-        Paragraph(company_name, s_bold),
-    ]
-    if company_reg:
-        issuer_block.append(Paragraph(f"Reg. No. {company_reg}", s_small))
-    if company_addr:
-        issuer_block.append(Paragraph(company_addr.replace("\n","<br/>"), s_small))
-
-    status_cell = Table([[Paragraph(payment.get("status","Pending").upper(), s_status)]],
-                         colWidths=[45*mm], rowHeights=[14*mm])
-    status_cell.setStyle(TableStyle([
-        ("BACKGROUND",(0,0),(-1,-1), status_bg),
-        ("VALIGN",(0,0),(-1,-1),"MIDDLE"),
-        ("ALIGN",(0,0),(-1,-1),"CENTER"),
-        ("ROUNDEDCORNERS",[6,6,6,6]),
-    ]))
-
-    top_tbl = Table([[issuer_block, status_cell]], colWidths=[120*mm, 50*mm])
-    top_tbl.setStyle(TableStyle([("VALIGN",(0,0),(-1,-1),"TOP"), ("ALIGN",(1,0),(1,0),"RIGHT")]))
-    story.append(top_tbl)
-    story.append(Spacer(1, 16))
-
-    # Payee / voucher details
-    def detail_row(label, value):
-        return [Paragraph(label, s_label), Paragraph(str(value) if value not in (None,"") else "—", s_normal)]
-
-    details = [
-        detail_row("Payee Type", payment.get("payee_type","")),
-        detail_row("Payee Name", payment.get("payee_name","")),
-        detail_row("Category", payment.get("category","")),
-        detail_row("Description", payment.get("description","")),
-        detail_row("Payment Date", payment.get("payment_date","")),
-        detail_row("Payment Method", payment.get("payment_method","")),
-        detail_row("Reference No.", payment.get("reference_no","")),
-    ]
-    det_tbl = Table(details, colWidths=[45*mm, 105*mm])
-    det_tbl.setStyle(TableStyle([
-        ("TOPPADDING",(0,0),(-1,-1),5), ("BOTTOMPADDING",(0,0),(-1,-1),5),
-        ("LINEBELOW",(0,0),(-1,-1),0.3, LIGHT),
-        ("VALIGN",(0,0),(-1,-1),"TOP"),
-    ]))
-    story.append(det_tbl)
-    story.append(Spacer(1, 14))
-
-    # Amount box
-    amt_due  = float(payment.get("amount_due") or 0)
-    amt_paid = float(payment.get("amount_paid") or 0)
-    balance  = amt_due - amt_paid
-
-    amt_tbl = Table([
-        [Paragraph("Amount Due", s_label), Paragraph(f"RM {amt_due:,.2f}", s_bold)],
-        [Paragraph("Amount Paid", s_label), Paragraph(f"RM {amt_paid:,.2f}", s_bold)],
-        [Paragraph("Balance", s_label), Paragraph(f"RM {balance:,.2f}", ParagraphStyle(
-            "balv", fontName="Helvetica-Bold", fontSize=13, textColor=ACCENT))],
-    ], colWidths=[40*mm, 110*mm])
-    amt_tbl.setStyle(TableStyle([
-        ("BACKGROUND",(0,0),(-1,-1), colors.HexColor("#FAF8F5")),
-        ("BOX",(0,0),(-1,-1), 0.5, LIGHT),
-        ("TOPPADDING",(0,0),(-1,-1),8), ("BOTTOMPADDING",(0,0),(-1,-1),8),
-        ("LEFTPADDING",(0,0),(-1,-1),10),
-        ("LINEBELOW",(0,0),(1,1),0.3, LIGHT),
-    ]))
-    story.append(amt_tbl)
-    story.append(Spacer(1, 10))
-
-    if payment.get("notes"):
-        story.append(Paragraph("NOTES", s_label))
-        story.append(Paragraph(payment["notes"], s_small))
-        story.append(Spacer(1, 10))
-
-    attach_lines = []
-    if payment.get("receipt_path"):
-        r_url = get_payment_file_url(payment["receipt_path"])
-        if r_url:
-            attach_lines.append(f'📎 <link href="{r_url}" color="#1A6B5A">View Receipt</link> (link valid 14 days)')
-        else:
-            attach_lines.append("📎 Receipt attached (link could not be generated — check in-app)")
-    if payment.get("proof_of_payment_path"):
-        p_url = get_payment_file_url(payment["proof_of_payment_path"])
-        if p_url:
-            attach_lines.append(f'📎 <link href="{p_url}" color="#1A6B5A">View Proof of Payment</link> (link valid 14 days)')
-        else:
-            attach_lines.append("📎 Proof of payment attached (link could not be generated — check in-app)")
-    if attach_lines:
-        story.append(Paragraph("ATTACHMENTS", s_label))
-        for line in attach_lines:
-            story.append(Paragraph(line, s_small))
-        story.append(Spacer(1, 10))
-
-    # Signature lines
-    story.append(Spacer(1, 24))
-    sig_tbl = Table([
-        ["_______________________________", "_______________________________"],
-        ["Prepared By", "Approved By"],
-    ], colWidths=[75*mm, 75*mm])
-    sig_tbl.setStyle(TableStyle([
-        ("TEXTCOLOR",(0,0),(-1,0), LIGHT),
-        ("TEXTCOLOR",(0,1),(-1,1), GREY),
-        ("FONTSIZE",(0,0),(-1,-1), 8.5),
-        ("TOPPADDING",(0,1),(-1,1), 2),
-    ]))
-    story.append(sig_tbl)
-
-    story.append(Spacer(1, 18))
-    story.append(HRFlowable(width="100%", thickness=0.5, color=LIGHT, spaceAfter=8))
-    story.append(Paragraph(
-        f"Generated on {datetime.datetime.now().strftime('%d %B %Y %H:%M')} · ULU Mahsuri Villa Operations Accountant",
-        s_small
-    ))
-
-    doc.build(story)
-    return buffer.getvalue()
-
 
 # ─────────────────────────────────────────────
 # HEADER
 # ─────────────────────────────────────────────
 st.markdown("""
-<div class="app-header">
-  <h1>🌾 ULU Mahsuri Villa</h1>
-  <p>Operations Accountant · Langkawi · Personal Income Tracking</p>
+<div id="ulu-header">
+  <h1 style="color:#F5F0E8 !important;">🌾 ULU Mahsuri Villa</h1>
+  <p style="color:#A8B8A5 !important;">Operations Accountant · Langkawi · Personal Income Tracking</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -1153,68 +1007,6 @@ with st.sidebar:
     )
     if api_key_input:
         st.session_state["ulu_api_key"] = api_key_input
-
-    st.divider()
-
-    with st.expander("🏢 Property Manager & Company Details"):
-        st.caption("Used on payment vouchers in the Payments & Vouchers tab.")
-
-        pm_name_val = st.text_input(
-            "Property Manager Name",
-            value=get_setting("property_manager_name") or "",
-            key="setting_pm_name",
-            placeholder="e.g. Azary bin ..."
-        )
-        pm_phone_val = st.text_input(
-            "Property Manager WhatsApp No.",
-            value=get_setting("property_manager_phone") or "",
-            key="setting_pm_phone",
-            placeholder="e.g. 60123456789",
-            help="Country code + number, no + or leading 0."
-        )
-        archmedia_name_val = st.text_input(
-            "Management Company Name",
-            value=get_setting("archmedia_company_name") or "Archmedia Sdn Bhd",
-            key="setting_archmedia_name"
-        )
-        archmedia_regno_val = st.text_input(
-            "Company Registration No.",
-            value=get_setting("archmedia_reg_no") or "",
-            key="setting_archmedia_regno",
-            placeholder="e.g. 123456-A"
-        )
-        archmedia_address_val = st.text_area(
-            "Company Address",
-            value=get_setting("archmedia_address") or "",
-            key="setting_archmedia_address",
-            height=70
-        )
-        archmedia_bank_val = st.text_input(
-            "Bank Name",
-            value=get_setting("archmedia_bank_name") or "",
-            key="setting_archmedia_bank"
-        )
-        archmedia_acct_val = st.text_input(
-            "Bank Account No.",
-            value=get_setting("archmedia_bank_account") or "",
-            key="setting_archmedia_acct"
-        )
-        archmedia_contact_val = st.text_input(
-            "Contact (phone / email)",
-            value=get_setting("archmedia_contact") or "",
-            key="setting_archmedia_contact"
-        )
-
-        if st.button("💾 Save Details", key="save_pm_settings", use_container_width=True):
-            set_setting("property_manager_name", pm_name_val)
-            set_setting("property_manager_phone", pm_phone_val)
-            set_setting("archmedia_company_name", archmedia_name_val)
-            set_setting("archmedia_reg_no", archmedia_regno_val)
-            set_setting("archmedia_address", archmedia_address_val)
-            set_setting("archmedia_bank_name", archmedia_bank_val)
-            set_setting("archmedia_bank_account", archmedia_acct_val)
-            set_setting("archmedia_contact", archmedia_contact_val)
-            st.success("Saved.")
 
     st.divider()
     st.caption(f"DB: {DB_PATH}")
@@ -1295,7 +1087,7 @@ with tab1:
     with col_right:
         st.markdown('<div class="card">', unsafe_allow_html=True)
         st.markdown('<p class="card-title">➕ Manager\'s Monthly Expenses</p>', unsafe_allow_html=True)
-        st.caption("Key in line by line from the Property Manager's monthly submission PDF")
+        st.caption("Key in line by line from Azary's monthly submission PDF")
 
         MANAGER_ITEMS = [
             "Pool Cleaner","WiFi (Unifi)","Water Filter (Coway)",
@@ -1420,7 +1212,7 @@ with tab2:
                 fc3.metric("Net Profit", fmt_myr(r.get("net_profit", 0)))
                 fc4, fc5 = st.columns(2)
                 fc4.metric("Owner Share (70%)", fmt_myr(r.get("owner_share", 0)))
-                fc5.metric("Management Fee (30%)", fmt_myr(r.get("cohost_share", 0)))
+                fc5.metric("Co-Host Share (30%)", fmt_myr(r.get("cohost_share", 0)))
 
                 st.markdown("**Bookings extracted:**")
                 bk_preview = []
@@ -1533,7 +1325,7 @@ with tab2:
                 st.markdown(
                     "<div style='text-align:center;padding:60px 0;color:#A89F91;'>"
                     "<div style='font-size:3rem'>📋</div>"
-                    "<p>Upload the Property Manager's monthly billing report on the left.<br>"
+                    "<p>Upload Azary's monthly billing report on the left.<br>"
                     "AI will extract all bookings and expenses for your review before saving.</p>"
                     "</div>", unsafe_allow_html=True
                 )
@@ -1554,7 +1346,7 @@ with tab2:
                     sc1.metric("Gross Income", fmt_myr(s['gross_income']))
                     sc2.metric("Total OpEx", fmt_myr(s['total_opex']))
                     sc3.metric("Owner Share", fmt_myr(s['owner_share']))
-                    sc4.metric("Management Fee", fmt_myr(s['cohost_share']))
+                    sc4.metric("Co-Host Share", fmt_myr(s['cohost_share']))
 
                     st.caption(f"File: {s['file_name']} | Scanned: {s['created_at']}")
 
@@ -1707,7 +1499,7 @@ with tab3:
     c1,c2,c3,c4 = st.columns(4)
     c1.markdown(f'<div class="metric-box"><div class="metric-label">Gross Income</div><div class="metric-value">RM {summary["gross_income"]:,.0f}</div></div>', unsafe_allow_html=True)
     c2.markdown(f'<div class="metric-box mid"><div class="metric-label">Gross Op Cost</div><div class="metric-value">RM {summary["gross_op_cost"]:,.0f}</div></div>', unsafe_allow_html=True)
-    c3.markdown(f'<div class="metric-box mid"><div class="metric-label">Management Fee ({summary["cohost_pct"]:.0f}%)</div><div class="metric-value">RM {summary["cohost_share"]:,.0f}</div></div>', unsafe_allow_html=True)
+    c3.markdown(f'<div class="metric-box mid"><div class="metric-label">Co-Host ({summary["cohost_pct"]:.0f}%)</div><div class="metric-value">RM {summary["cohost_share"]:,.0f}</div></div>', unsafe_allow_html=True)
     c4.markdown(f'<div class="metric-box accent"><div class="metric-label">Your Net Profit</div><div class="metric-value">RM {summary["owner_share"]:,.0f}</div></div>', unsafe_allow_html=True)
 
     st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
@@ -1724,7 +1516,7 @@ with tab3:
                 "  Personal Expenses (ULU Share)",
                 "Gross Operating Cost",
                 "Net Profit Before Sharing",
-                f"  Management Fee ({summary['cohost_pct']:.0f}%)",
+                f"  Co-Host Share ({summary['cohost_pct']:.0f}%)",
                 "Owner Net Profit"
             ],
             "Amount (RM)": [
@@ -1845,7 +1637,7 @@ with tab4:
     r1c1, r1c2, r1c3, r1c4 = st.columns(4)
     r1c1.markdown(f'<div class="metric-box"><div class="metric-label">Total Gross Income</div><div class="metric-value">RM {at_gross:,.0f}</div></div>', unsafe_allow_html=True)
     r1c2.markdown(f'<div class="metric-box mid"><div class="metric-label">Total OpEx Paid</div><div class="metric-value">RM {at_opex:,.0f}</div></div>', unsafe_allow_html=True)
-    r1c3.markdown(f'<div class="metric-box mid"><div class="metric-label">Paid to Archmedia Sdn Bhd</div><div class="metric-value">RM {at_cohost:,.0f}</div></div>', unsafe_allow_html=True)
+    r1c3.markdown(f'<div class="metric-box mid"><div class="metric-label">Co-Host Paid (Azary)</div><div class="metric-value">RM {at_cohost:,.0f}</div></div>', unsafe_allow_html=True)
     r1c4.markdown(f'<div class="metric-box accent"><div class="metric-label">Your Net Profit</div><div class="metric-value">RM {at_owner:,.0f}</div></div>', unsafe_allow_html=True)
 
     st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
@@ -1876,7 +1668,7 @@ with tab4:
             <span>·</span>
             <span><b>Master Bed:</b> {at_mbed} bookings ({at_mbed/at_bookings*100:.0f}%)</span>
             <span>·</span>
-            <span><b>Management Fee Rate:</b> {cohost_pct_setting:.0f}%</span>
+            <span><b>Co-Host Rate:</b> {cohost_pct_setting:.0f}%</span>
         </div>
         """, unsafe_allow_html=True)
 
@@ -1918,7 +1710,7 @@ with tab4:
             "Gross Income": f"{v['gross_income']:,.2f}",
             "Op Cost": f"{v['gross_op_cost']:,.2f}",
             "Net Before Share": f"{v['net_before_sharing']:,.2f}",
-            "Management Fee": f"{v['cohost_share']:,.2f}",
+            "Co-Host": f"{v['cohost_share']:,.2f}",
             "Owner Net": f"{v['owner_share']:,.2f}",
             "Net %": f"{nett_pct:.1f}%",
         })
@@ -1956,7 +1748,7 @@ with tab4:
         ce.metric("Total Nights", total_nights)
 
         avg_per_night = yearly_income / total_nights if total_nights else 0
-        st.caption(f"Average rate per night: {fmt_myr(avg_per_night)}")
+        st.markdown(f"<span style='color:#1C1C1A;font-size:1rem'>Average rate per night: <b>{fmt_myr(avg_per_night)}</b></span>", unsafe_allow_html=True)
 
         st.markdown("---")
         st.markdown("**Room Type Breakdown — Bookings, Nights & Revenue**")
@@ -2019,7 +1811,7 @@ with tab4:
         })
     if roi_rows:
         st.dataframe(pd.DataFrame(roi_rows), use_container_width=True, hide_index=True)
-        st.caption(f"Investment cost: {fmt_myr(inv_cost)}")
+        st.markdown(f"<span style='color:#1C1C1A;font-size:1rem'>Investment cost: <b>{fmt_myr(inv_cost)}</b></span>", unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════
@@ -2299,9 +2091,9 @@ with tab7:
                 highlight = "background:#fff8e1;padding:8px;border-radius:6px;margin-bottom:6px" if cur_cat == "Uncategorised" else "padding:4px;margin-bottom:4px"
                 st.markdown(f"<div style='{highlight}'>", unsafe_allow_html=True)
                 oc1,oc2,oc3,oc4 = st.columns([2,3,3,1])
-                oc1.caption(f"{MONTHS[r['month']-1]} {r['year']}")
-                oc2.caption(f"**{r['expense_item']}** — {r['vendor'] or ''}")
-                oc3.caption(fmt_myr(r["amount"]))
+                oc1.markdown(f"<span style='color:#1C1C1A;font-size:1rem'>{MONTHS[r['month']-1]} {r['year']}</span>", unsafe_allow_html=True)
+                oc2.markdown(f"<span style='color:#1C1C1A;font-size:1rem'><b>{r['expense_item']}</b> — {r['vendor'] or ''}</span>", unsafe_allow_html=True)
+                oc3.markdown(f"<span style='color:#1C1C1A;font-size:1rem;font-weight:600'>{fmt_myr(r['amount'])}</span>", unsafe_allow_html=True)
                 new_cat = oc4.selectbox("Category", OPEX_CATEGORIES,
                     index=cat_idx, key=f"opex_cat_{r['id']}",
                     label_visibility="collapsed")
@@ -2338,10 +2130,10 @@ with tab7:
                 pe_highlight = "padding:4px;margin-bottom:4px"
                 st.markdown(f"<div style='{pe_highlight}'>", unsafe_allow_html=True)
                 pc1, pc2, pc3, pc4, pc5, pc6 = st.columns([1.5, 2.5, 2, 2, 1.5, 0.5])
-                pc1.caption(f"{MONTHS[r['month']-1]} {r['year']}")
-                pc2.caption(f"**{r['vendor']}**")
-                pc3.caption(r["description"][:35] if r["description"] else "")
-                pc4.caption(fmt_myr(r["ulu_share"]))
+                pc1.markdown(f"<span style='color:#1C1C1A;font-size:1rem'>{MONTHS[r['month']-1]} {r['year']}</span>", unsafe_allow_html=True)
+                pc2.markdown(f"<span style='color:#1C1C1A;font-size:1rem'><b>{r['vendor']}</b></span>", unsafe_allow_html=True)
+                pc3.markdown(f"<span style='color:#1C1C1A;font-size:0.9rem'>{r['description'][:35] if r['description'] else ''}</span>", unsafe_allow_html=True)
+                pc4.markdown(f"<span style='color:#1C1C1A;font-size:1rem;font-weight:600'>{fmt_myr(r['ulu_share'])}</span>", unsafe_allow_html=True)
                 # Category edit
                 cur_pe_cat = r.get("category") or "Miscellaneous"
                 pe_cat_idx = EXPENSE_CATEGORIES.index(cur_pe_cat) if cur_pe_cat in EXPENSE_CATEGORIES else 0
@@ -2498,7 +2290,7 @@ with tab8:
         dc1, dc2 = st.columns(2)
         with dc1:
             st.markdown("#### 📊 Excel Workbook")
-            st.caption("Income Ledger · OpEx Breakdown · CapEx Schedule · P&L Summary · Payments & Vouchers")
+            st.caption("Income Ledger · OpEx Breakdown · CapEx Schedule · P&L Summary · ROI")
             if st.button("Generate Excel", type="primary", key="gen_ulu_excel"):
                 with st.spinner("Building workbook..."):
                     try:
@@ -2515,7 +2307,7 @@ with tab8:
                         ws0["A2"] = f"Period: {exp_period} {exp_year}"
                         ws0["A3"] = f"Generated: {datetime.datetime.now().strftime('%d %b %Y %H:%M')}"
                         ws0["A5"] = "Contents:"
-                        for i,s in enumerate(["Income Ledger","OpEx Breakdown","CapEx Schedule","P&L Summary","Payments & Vouchers"],1):
+                        for i,s in enumerate(["Income Ledger","OpEx Breakdown","CapEx Schedule","P&L Summary"],1):
                             ws0[f"A{5+i}"] = f"  {i}. {s}"
 
                         # -- Income Ledger --
@@ -2583,7 +2375,7 @@ with tab8:
                             ("Gross Rental Income", inc_rows),
                             ("Less: Operating Expenses", -opex_rows),
                             ("Net Before Profit Sharing", net_before),
-                            (f"Management Fee ({int(cohost_pct*100)}%)", -cohost_share),
+                            (f"Co-Host Share ({int(cohost_pct*100)}%)", -cohost_share),
                             ("Owner Net Profit", owner_net),
                             ("",""),
                             ("CapEx This Year (not in P&L)", capex_rows_sum),
@@ -2597,34 +2389,6 @@ with tab8:
                                 if label in ("Owner Net Profit","Gross Rental Income"):
                                     ws4.cell(ri,1).font=Font(bold=True)
                                     ws4.cell(ri,2).font=Font(bold=True)
-
-                        # -- Payments & Vouchers --
-                        ws5 = wb.create_sheet("Payments & Vouchers")
-                        hdrs5 = ["Payment Date","Payee Type","Payee Name","Category","Description",
-                                  "Amount Due (MYR)","Amount Paid (MYR)","Balance (MYR)","Status",
-                                  "Payment Method","Reference No.","Receipt Attached","Proof of Payment Attached","Notes"]
-                        for ci,h in enumerate(hdrs5,1):
-                            c = ws5.cell(1,ci,h); c.font=Font(bold=True,color="FFFFFF")
-                            c.fill=PatternFill("solid",fgColor="2a3528")
-                        conn2 = get_db()
-                        pay_all = conn2.execute(
-                            f"SELECT * FROM payments WHERE CAST(substr(payment_date,1,4) AS INTEGER)=? "
-                            f"AND CAST(substr(payment_date,6,2) AS INTEGER) IN ({ph}) ORDER BY payment_date",
-                            [exp_year]+period_mos
-                        ).fetchall()
-                        conn2.close()
-                        for ri,r in enumerate(pay_all,2):
-                            due  = float(r["amount_due"] or 0)
-                            paid = float(r["amount_paid"] or 0)
-                            vals5 = [r["payment_date"], r["payee_type"], r["payee_name"], r["category"],
-                                     r["description"], due, paid, due-paid, r["status"], r["payment_method"],
-                                     r["reference_no"], "Yes" if r["receipt_path"] else "No",
-                                     "Yes" if r["proof_of_payment_path"] else "No", r["notes"]]
-                            for ci,v in enumerate(vals5,1):
-                                ws5.cell(ri,ci,v)
-                        ws5.cell(len(pay_all)+2,1,"TOTAL").font=Font(bold=True)
-                        ws5.cell(len(pay_all)+2,6,sum(float(r["amount_due"] or 0) for r in pay_all)).font=Font(bold=True)
-                        ws5.cell(len(pay_all)+2,7,sum(float(r["amount_paid"] or 0) for r in pay_all)).font=Font(bold=True)
 
                         conn.close()
                         # Save
@@ -2712,7 +2476,7 @@ with tab8:
                             ["Gross Rental Income", f"{inc_rows:,.2f}"],
                             ["  Manager Expenses", f"({opex_rows:,.2f})"],
                             ["  Net Before Sharing", f"{net_before:,.2f}"],
-                            [f"  Management Fee ({int(cohost_pct*100)}%)", f"({cohost_share:,.2f})"],
+                            [f"  Co-Host Share ({int(cohost_pct*100)}%)", f"({cohost_share:,.2f})"],
                             ["Owner Net Profit", f"{owner_net:,.2f}"],
                             ["", ""],
                             ["CapEx This Year (memo only)", f"{capex_rows_sum:,.2f}"],
@@ -2894,7 +2658,7 @@ with tab8:
 
     with acct_tab2:
         st.subheader("Share Access with Accountant / Tax Agent")
-        share1, share2, share3 = st.tabs(["☁️ OneDrive Links", "💳 Payment Vouchers", "📋 What to Share"])
+        share1, share2 = st.tabs(["☁️ OneDrive Links", "📋 What to Share"])
 
         with share1:
             st.caption("Paste your OneDrive sharing links below to generate a WhatsApp message.")
@@ -2904,15 +2668,12 @@ with tab8:
                 placeholder="Right-click folder → Share → Copy link")
             od_reports = st.text_input("📊 ULU Accountant Reports folder link", key="od_ulu_rpt",
                 placeholder="Right-click folder → Share → Copy link")
-            od_payments = st.text_input("💳 Payment Voucher Attachments folder link", key="od_ulu_payments",
-                placeholder="Right-click folder → Share → Copy link")
 
             if st.button("📱 Generate WhatsApp Message", key="gen_ulu_wa"):
                 links = ""
-                if od_reports:  links += f"📊 *Financial Reports (Excel):*\n{od_reports}\n\n"
-                if od_mgr:      links += f"📋 *Manager Monthly Reports (Property Manager's Submissions):*\n{od_mgr}\n\n"
-                if od_capex:    links += f"📋 *CapEx Receipts & Invoices:*\n{od_capex}\n\n"
-                if od_payments: links += f"💳 *Payment Vouchers, Receipts & Proof of Payment:*\n{od_payments}\n\n"
+                if od_reports: links += f"📊 *Financial Reports (Excel):*\n{od_reports}\n\n"
+                if od_mgr:     links += f"📋 *Manager Monthly Reports (Azary's Submissions):*\n{od_mgr}\n\n"
+                if od_capex:   links += f"📋 *CapEx Receipts & Invoices:*\n{od_capex}\n\n"
                 if not links:
                     st.warning("Please paste at least one link.")
                 else:
@@ -2929,64 +2690,12 @@ with tab8:
                     st.success("✓ Message ready. Copy and send via WhatsApp.")
 
         with share2:
-            st.caption("Payment records and their receipt / proof-of-payment attachments live in secure "
-                       "cloud storage, not OneDrive. This tab lets you access every payment record directly "
-                       "in the app (same login as everything else), or send a summary with signed download "
-                       "links to a specific accountant / tax agent.")
-
-            st.markdown("**Full access:** everything recorded in the *Payments & Vouchers* tab — every "
-                       "record, status, and attachment — is already visible to anyone with access to this app, "
-                       "no extra sharing step needed.")
-            st.divider()
-
-            st.markdown("**Or send a summary for a specific period:**")
-            sp1, sp2 = st.columns(2)
-            sh_year  = sp1.selectbox("Year", list(range(datetime.datetime.now().year, 2023, -1)), key="sh_pay_year")
-            sh_status = sp2.multiselect("Status", ["Pending","Partial","Paid"], key="sh_pay_status")
-
-            if st.button("📱 Generate Payment Summary for WhatsApp", key="gen_pay_wa"):
-                conn = get_db()
-                rows = conn.execute(
-                    "SELECT * FROM payments WHERE CAST(substr(payment_date,1,4) AS INTEGER)=? ORDER BY payment_date",
-                    (sh_year,)
-                ).fetchall()
-                conn.close()
-                if sh_status:
-                    rows = [r for r in rows if r["status"] in sh_status]
-
-                if not rows:
-                    st.warning("No payment records found for that year/status.")
-                else:
-                    lines = [f"Hi, here are the payment records for ULU Mahsuri Villa ({sh_year}):", ""]
-                    for r in rows:
-                        due  = float(r["amount_due"] or 0)
-                        paid = float(r["amount_paid"] or 0)
-                        lines.append(f"PV-{r['id']:05d} · {r['payment_date']} · {r['payee_name']} · "
-                                     f"{r['category']} · RM {due:,.2f} ({r['status']})")
-                        if r.get("receipt_path"):
-                            r_url = get_payment_file_url(r["receipt_path"], expires_in=1209600)
-                            if r_url:
-                                lines.append(f"  Receipt: {r_url}")
-                        if r.get("proof_of_payment_path"):
-                            p_url = get_payment_file_url(r["proof_of_payment_path"], expires_in=1209600)
-                            if p_url:
-                                lines.append(f"  Proof of Payment: {p_url}")
-                        lines.append("")
-                    lines.append("All links are view-only and valid for 14 days. Please contact me if you need anything else.")
-                    lines.append("— Azlan")
-
-                    wa_summary = "\n".join(lines)
-                    st.text_area("📱 WhatsApp Message (copy & paste):", value=wa_summary,
-                                 height=300, key="pay_wa_msg")
-                    st.success(f"✓ {len(rows)} record(s) included. Links valid for 14 days from now.")
-
-        with share3:
             st.markdown("""
 **What to prepare for your accountant / tax agent:**
 
 **For Income Tax (LHDN):**
 - ✅ Excel Workbook (Income Ledger + P&L Summary)
-- ✅ Manager Monthly Reports (Property Manager's original billing submissions)
+- ✅ Manager Monthly Reports (Azary's original billing submissions)
 - ✅ Airbnb statements for the year
 - ✅ CapEx Schedule (for depreciation claims)
 
@@ -3000,405 +2709,10 @@ with tab8:
 - CapEx receipts must be kept as evidence for 7 years
 
 **What the accountant needs each year:**
-1. Generate Excel report from this tab (now includes a Payments & Vouchers sheet)
+1. Generate Excel report from this tab
 2. Share CapEx Receipts folder (all original invoices)
 3. Share ULU Accountant Reports folder
-4. Give access to the Payments & Vouchers tab, or share the Payment Voucher Attachments folder (see OneDrive Links above), for full visibility on management fee and reimbursement payments
 """)
-    st.markdown('</div>', unsafe_allow_html=True)
-
-
-# ══════════════════════════════════════════════
-# TAB 9 — PAYMENTS & VOUCHERS
-# ══════════════════════════════════════════════
-with tab9:
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown('<p class="card-title">💳 Payments & Vouchers</p>', unsafe_allow_html=True)
-    st.caption("Record payments to the Property Manager, Archmedia Sdn Bhd (management fee), "
-               "and Suppliers/Vendors, with receipt + proof-of-payment attachments and printable vouchers. "
-               "Every record here is visible to whoever has access to this app, including the Accountant.")
-
-    pay_tab1, pay_tab2, pay_tab3, pay_tab4 = st.tabs(
-        ["➕ Record Payment", "📋 All Payment Records", "🧾 Generate Voucher PDF", "🔄 Sync to Local Folder"]
-    )
-
-    PAYEE_TYPES = ["Property Manager (Reimbursable)", "Archmedia Sdn Bhd (Management Fee)", "Vendor / Supplier (Direct Expense)"]
-    PAYMENT_STATUSES = ["Pending", "Partial", "Paid"]
-    PAYMENT_METHODS = ["Bank Transfer", "Cash", "Cheque", "DuitNow", "Other"]
-
-    # ── SUB-TAB 1: RECORD PAYMENT ──────────────────────────────────────
-    with pay_tab1:
-        st.subheader("Record a New Payment")
-
-        link_existing = st.checkbox("Link to an existing expense record", key="pay_link_existing")
-
-        linked_source_table = ""
-        linked_source_id = None
-        prefill_payee = ""
-        prefill_desc = ""
-        prefill_amount = 0.0
-
-        if link_existing:
-            src_choice = st.radio("Source", ["Manager Expense", "Personal Expense", "CapEx Item"],
-                                   horizontal=True, key="pay_src_choice")
-            conn = get_db()
-            if src_choice == "Manager Expense":
-                rows = conn.execute(
-                    "SELECT * FROM manager_expenses ORDER BY year DESC, month DESC, id DESC LIMIT 200"
-                ).fetchall()
-                options = {f"#{r['id']} · {MONTHS[r['month']-1]} {r['year']} · {r['expense_item']} · {r['vendor']} · RM{float(r['amount'] or 0):,.2f}": r for r in rows}
-            elif src_choice == "Personal Expense":
-                rows = conn.execute(
-                    "SELECT * FROM personal_expenses ORDER BY year DESC, month DESC, id DESC LIMIT 200"
-                ).fetchall()
-                options = {f"#{r['id']} · {MONTHS[r['month']-1]} {r['year']} · {r['vendor']} · {r['category']} · RM{float(r['ulu_share'] or 0):,.2f}": r for r in rows}
-            else:
-                rows = conn.execute(
-                    "SELECT * FROM capex_items ORDER BY purchase_date DESC LIMIT 200"
-                ).fetchall()
-                options = {f"#{r['id']} · {r['purchase_date']} · {r['vendor']} · {r['description']} · RM{float(r['amount'] or 0):,.2f}": r for r in rows}
-            conn.close()
-
-            if options:
-                pick = st.selectbox("Select record", list(options.keys()), key="pay_pick_record")
-                picked = options[pick]
-                linked_source_table = {"Manager Expense":"manager_expenses","Personal Expense":"personal_expenses","CapEx Item":"capex_items"}[src_choice]
-                linked_source_id = picked["id"]
-                if src_choice == "Manager Expense":
-                    prefill_payee  = picked["vendor"] or ""
-                    prefill_desc   = picked["expense_item"] or ""
-                    prefill_amount = float(picked["amount"] or 0)
-                elif src_choice == "Personal Expense":
-                    prefill_payee  = picked["vendor"] or ""
-                    prefill_desc   = picked["description"] or picked["category"] or ""
-                    prefill_amount = float(picked["ulu_share"] or 0)
-                else:
-                    prefill_payee  = picked["vendor"] or ""
-                    prefill_desc   = picked["description"] or ""
-                    prefill_amount = float(picked["amount"] or 0)
-            else:
-                st.info("No records found for this source yet.")
-
-        pc1, pc2, pc3 = st.columns([1.3, 1.5, 1.2])
-        payee_type = pc1.selectbox("Payee Type", PAYEE_TYPES, key="pay_payee_type")
-
-        default_payee_name = prefill_payee
-        default_payee_phone = ""
-        if not default_payee_name:
-            if payee_type.startswith("Property Manager"):
-                default_payee_name = get_setting("property_manager_name") or ""
-                default_payee_phone = get_setting("property_manager_phone") or ""
-            elif payee_type.startswith("Archmedia"):
-                default_payee_name = get_setting("archmedia_company_name") or "Archmedia Sdn Bhd"
-                default_payee_phone = get_setting("archmedia_contact") or ""
-
-        payee_name  = pc2.text_input("Payee Name", value=default_payee_name, key="pay_payee_name")
-        payee_phone = pc3.text_input("WhatsApp No. (optional)", value=default_payee_phone,
-                                      key="pay_payee_phone", placeholder="e.g. 60123456789",
-                                      help="Country code + number, no + or leading 0. Used to send the voucher directly via WhatsApp.")
-
-        default_category = ""
-        if payee_type.startswith("Archmedia"):
-            cohost_pct_disp = float(get_setting("cohost_pct") or 30)
-            default_category = f"Management Fee ({cohost_pct_disp:.0f}%)"
-        elif payee_type.startswith("Property Manager"):
-            default_category = "Reimbursable Expense"
-        else:
-            default_category = "Direct Expense"
-
-        cc1, cc2 = st.columns(2)
-        category = cc1.text_input("Category", value=default_category, key="pay_category")
-        description = cc2.text_input("Description", value=prefill_desc, key="pay_description")
-
-        ac1, ac2, ac3 = st.columns(3)
-        amount_due  = ac1.number_input("Amount Due (RM)", min_value=0.0, value=float(prefill_amount), step=10.0, key="pay_amount_due")
-        status      = ac2.selectbox("Status", PAYMENT_STATUSES, key="pay_status")
-        amount_paid = ac3.number_input("Amount Paid (RM)", min_value=0.0,
-                                        value=float(prefill_amount) if status=="Paid" else 0.0,
-                                        step=10.0, key="pay_amount_paid")
-
-        dc1, dc2, dc3 = st.columns(3)
-        payment_date_val = dc1.date_input("Payment Date", value=datetime.date.today(), key="pay_date")
-        payment_method   = dc2.selectbox("Payment Method", PAYMENT_METHODS, key="pay_method")
-        reference_no     = dc3.text_input("Reference No.", key="pay_reference")
-
-        fc1, fc2 = st.columns(2)
-        receipt_file = fc1.file_uploader("📎 Attach Receipt", type=["jpg","jpeg","png","pdf"], key="pay_receipt_upload")
-        proof_file   = fc2.file_uploader("📎 Attach Proof of Payment", type=["jpg","jpeg","png","pdf"], key="pay_proof_upload")
-
-        notes = st.text_area("Notes", key="pay_notes", height=70)
-
-        if st.button("💾 Save Payment Record", key="pay_save_btn", use_container_width=True):
-            if not payee_name.strip():
-                st.warning("Please enter a payee name.")
-            else:
-                receipt_bytes = receipt_file.read() if receipt_file else None
-                proof_bytes   = proof_file.read() if proof_file else None
-
-                receipt_path = upload_payment_file(receipt_bytes, receipt_file.name, "receipt") if receipt_bytes else None
-                proof_path   = upload_payment_file(proof_bytes, proof_file.name, "proof") if proof_bytes else None
-
-                # Insert directly via the Supabase client (bypassing the SQL-emulation layer
-                # here) so we get the new row's id back immediately — needed to name local
-                # files consistently with what the sync tool expects (PV-00001_receipt.ext).
-                sb = get_supabase()
-                insert_res = sb.table("payments").insert({
-                    "payment_date": str(payment_date_val), "payee_type": payee_type,
-                    "payee_name": payee_name, "payee_phone": payee_phone, "category": category,
-                    "source_table": linked_source_table, "source_id": linked_source_id,
-                    "description": description, "amount_due": amount_due, "amount_paid": amount_paid,
-                    "status": status, "payment_method": payment_method, "reference_no": reference_no,
-                    "receipt_path": receipt_path, "proof_of_payment_path": proof_path, "notes": notes,
-                }).execute()
-                new_id = insert_res.data[0]["id"] if insert_res.data else None
-
-                # Also save a local copy (synced via OneDrive) so the accountant can be given
-                # one persistent folder link, same pattern as CapEx Receipts. Only persists
-                # when running the local app — Streamlit Cloud's disk resets on redeploy.
-                if new_id and (receipt_bytes or proof_bytes):
-                    local_folder = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                                 "Payment Voucher Attachments")
-                    os.makedirs(local_folder, exist_ok=True)
-                    if receipt_bytes:
-                        ext = Path(receipt_file.name).suffix or ".bin"
-                        fn = f"PV-{new_id:05d}_receipt{ext}"
-                        with open(os.path.join(local_folder, fn), "wb") as _f:
-                            _f.write(receipt_bytes)
-                    if proof_bytes:
-                        ext = Path(proof_file.name).suffix or ".bin"
-                        fn = f"PV-{new_id:05d}_proof{ext}"
-                        with open(os.path.join(local_folder, fn), "wb") as _f:
-                            _f.write(proof_bytes)
-
-                st.success("✅ Payment record saved.")
-                st.rerun()
-
-    # ── SUB-TAB 2: ALL PAYMENT RECORDS ─────────────────────────────────
-    with pay_tab2:
-        st.subheader("All Payment Records")
-
-        conn = get_db()
-        all_payments = conn.execute("SELECT * FROM payments ORDER BY payment_date DESC, id DESC").fetchall()
-        conn.close()
-
-        if not all_payments:
-            st.info("No payment records yet. Add one in the 'Record Payment' tab.")
-        else:
-            fcol1, fcol2 = st.columns(2)
-            f_type   = fcol1.multiselect("Filter by Payee Type", PAYEE_TYPES, key="pay_filter_type")
-            f_status = fcol2.multiselect("Filter by Status", PAYMENT_STATUSES, key="pay_filter_status")
-
-            filtered = [p for p in all_payments
-                        if (not f_type or p["payee_type"] in f_type)
-                        and (not f_status or p["status"] in f_status)]
-
-            tot_due  = sum(float(p["amount_due"] or 0) for p in filtered)
-            tot_paid = sum(float(p["amount_paid"] or 0) for p in filtered)
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Total Due", fmt_myr(tot_due))
-            m2.metric("Total Paid", fmt_myr(tot_paid))
-            m3.metric("Outstanding", fmt_myr(tot_due - tot_paid))
-            st.divider()
-
-            status_icon = {"Paid":"🟢","Partial":"🟡","Pending":"🔴"}
-
-            for p in filtered:
-                header = (f"{status_icon.get(p['status'],'⚪')} #{p['id']} · {p['payment_date']} · "
-                          f"{p['payee_name']} · {p['category']} · RM {float(p['amount_due'] or 0):,.2f} ({p['status']})")
-                with st.expander(header):
-                    e1, e2 = st.columns(2)
-                    e1.write(f"**Payee Type:** {p['payee_type']}")
-                    e1.write(f"**Description:** {p.get('description') or '—'}")
-                    e1.write(f"**Payment Method:** {p.get('payment_method') or '—'}")
-                    e1.write(f"**Reference No.:** {p.get('reference_no') or '—'}")
-                    e2.write(f"**Amount Due:** {fmt_myr(float(p['amount_due'] or 0))}")
-                    e2.write(f"**Amount Paid:** {fmt_myr(float(p['amount_paid'] or 0))}")
-                    e2.write(f"**Balance:** {fmt_myr(float(p['amount_due'] or 0) - float(p['amount_paid'] or 0))}")
-                    if p.get("notes"):
-                        st.caption(f"Notes: {p['notes']}")
-
-                    lcol1, lcol2 = st.columns(2)
-                    if p.get("receipt_path"):
-                        rurl = get_payment_file_url(p["receipt_path"])
-                        if rurl:
-                            lcol1.markdown(f"[📄 View Receipt]({rurl})")
-                    else:
-                        lcol1.caption("No receipt attached")
-                    if p.get("proof_of_payment_path"):
-                        purl = get_payment_file_url(p["proof_of_payment_path"])
-                        if purl:
-                            lcol2.markdown(f"[📄 View Proof of Payment]({purl})")
-                    else:
-                        lcol2.caption("No proof of payment attached")
-
-                    st.markdown("---")
-                    uc1, uc2, uc3 = st.columns(3)
-                    new_status = uc1.selectbox("Update Status", PAYMENT_STATUSES,
-                                                index=PAYMENT_STATUSES.index(p["status"]) if p["status"] in PAYMENT_STATUSES else 0,
-                                                key=f"upd_status_{p['id']}")
-                    new_paid = uc2.number_input("Update Amount Paid (RM)", min_value=0.0,
-                                                 value=float(p["amount_paid"] or 0), step=10.0,
-                                                 key=f"upd_paid_{p['id']}")
-                    if uc3.button("Update", key=f"upd_btn_{p['id']}"):
-                        conn = get_db()
-                        conn.execute("UPDATE payments SET status=?, amount_paid=? WHERE id=?",
-                                     (new_status, new_paid, p["id"]))
-                        conn.commit(); conn.close()
-                        st.success("Updated.")
-                        st.rerun()
-
-                    if st.button("🗑️ Delete Record", key=f"del_pay_{p['id']}"):
-                        conn = get_db()
-                        conn.execute("DELETE FROM payments WHERE id=?", (p["id"],))
-                        conn.commit(); conn.close()
-                        st.success("Deleted.")
-                        st.rerun()
-
-    # ── SUB-TAB 3: GENERATE VOUCHER PDF ────────────────────────────────
-    with pay_tab3:
-        st.subheader("Generate Payment Voucher PDF")
-
-        conn = get_db()
-        voucher_rows = conn.execute("SELECT * FROM payments ORDER BY payment_date DESC, id DESC").fetchall()
-        conn.close()
-
-        if not voucher_rows:
-            st.info("No payment records yet. Add one in the 'Record Payment' tab.")
-        else:
-            v_options = {f"#{p['id']} · {p['payment_date']} · {p['payee_name']} · RM {float(p['amount_due'] or 0):,.2f} ({p['status']})": p
-                         for p in voucher_rows}
-            v_pick = st.selectbox("Select payment record", list(v_options.keys()), key="voucher_pick")
-            v_row = v_options[v_pick]
-
-            st.write(f"**Payee:** {v_row['payee_name']}  |  **Category:** {v_row['category']}  |  **Status:** {v_row['status']}")
-
-            if st.button("🧾 Generate Voucher", key="gen_voucher_btn"):
-                pdf_bytes = generate_payment_voucher_pdf(v_row)
-                st.session_state[f"voucher_pdf_{v_row['id']}"] = pdf_bytes
-                st.session_state.pop(f"voucher_link_{v_row['id']}", None)  # any old link is now stale
-
-                # Save a local copy too (synced via OneDrive), same folder as receipts/proofs,
-                # so the accountant can be given one persistent folder link for everything.
-                local_folder = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                             "Payment Voucher Attachments")
-                os.makedirs(local_folder, exist_ok=True)
-                fn = f"Payment_Voucher_PV-{v_row['id']:05d}.pdf"
-                with open(os.path.join(local_folder, fn), "wb") as _f:
-                    _f.write(pdf_bytes)
-
-            pdf_bytes = st.session_state.get(f"voucher_pdf_{v_row['id']}")
-
-            if not pdf_bytes:
-                st.caption("Click 'Generate Voucher' to create the PDF.")
-            else:
-                st.download_button(
-                    "⬇️ Download Payment Voucher PDF",
-                    data=pdf_bytes,
-                    file_name=f"Payment_Voucher_PV-{v_row['id']:05d}.pdf",
-                    mime="application/pdf",
-                    key="dl_voucher_btn"
-                )
-
-                st.divider()
-                st.markdown("**📲 Share with Payee via WhatsApp**")
-                st.caption("Uploads the voucher to secure storage and creates a 14-day download link "
-                           "(plus links to any attached receipt / proof of payment), ready to send on WhatsApp.")
-
-                if st.button("🔗 Create Shareable Link", key="create_voucher_link_btn"):
-                    voucher_path = upload_payment_file(pdf_bytes, f"PV-{v_row['id']:05d}.pdf", "voucher")
-                    if voucher_path:
-                        st.session_state[f"voucher_link_{v_row['id']}"] = get_payment_file_url(voucher_path, expires_in=1209600)  # 14 days
-                        st.success("Link created — valid for 14 days.")
-
-                voucher_url = st.session_state.get(f"voucher_link_{v_row['id']}")
-
-                if voucher_url:
-                    msg_lines = [
-                        f"Hi {v_row['payee_name']}, here's your payment voucher from ULU Mahsuri Villa.",
-                        "",
-                        f"Voucher No.: PV-{v_row['id']:05d}",
-                        f"Category: {v_row['category']}",
-                        f"Amount Due: RM {float(v_row['amount_due'] or 0):,.2f}",
-                        f"Amount Paid: RM {float(v_row['amount_paid'] or 0):,.2f}",
-                        f"Status: {v_row['status']}",
-                        "",
-                        f"Download voucher (link valid 14 days): {voucher_url}",
-                    ]
-                    if v_row.get("receipt_path"):
-                        r_url = get_payment_file_url(v_row["receipt_path"])
-                        if r_url:
-                            msg_lines.append(f"Receipt: {r_url}")
-                    if v_row.get("proof_of_payment_path"):
-                        p_url = get_payment_file_url(v_row["proof_of_payment_path"])
-                        if p_url:
-                            msg_lines.append(f"Proof of Payment: {p_url}")
-                    msg_lines += ["", "Thank you."]
-
-                    wa_message = "\n".join(msg_lines)
-                    encoded_msg = urllib.parse.quote(wa_message)
-
-                    phone = (v_row.get("payee_phone") or "").strip().lstrip("+").replace(" ", "").replace("-", "")
-                    wa_url = f"https://wa.me/{phone}?text={encoded_msg}" if phone else f"https://wa.me/?text={encoded_msg}"
-
-                    st.link_button("📲 Open in WhatsApp", wa_url, use_container_width=True)
-                    if not phone:
-                        st.caption("No WhatsApp number saved for this payee — you'll pick the contact inside WhatsApp.")
-                    st.text_area("Or copy this message manually:", value=wa_message, height=220,
-                                 key=f"wa_msg_{v_row['id']}")
-
-    # ── SUB-TAB 4: SYNC TO LOCAL FOLDER ────────────────────────────────
-    with pay_tab4:
-        st.subheader("Sync Missing Attachments to Local Folder")
-        st.caption(
-            "If you recorded a payment while working remotely (cloud app, another device), "
-            "its receipt/proof of payment is safely stored in Supabase — but never reached "
-            "your Dell's local 'Payment Voucher Attachments' folder, since that only happens "
-            "when the app runs locally. Run this next time you're back on the Dell to catch up. "
-            "Scope note: this covers receipts and proof-of-payment only — generated voucher PDFs "
-            "aren't tracked for sync since they're created on demand, not stored persistently "
-            "unless you've used 'Create Shareable Link' for that specific voucher."
-        )
-
-        if st.button("🔄 Check & Sync Missing Attachments", key="sync_attachments_btn"):
-            conn = get_db()
-            all_rows = conn.execute("SELECT * FROM payments ORDER BY id").fetchall()
-            conn.close()
-
-            local_folder = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                         "Payment Voucher Attachments")
-            os.makedirs(local_folder, exist_ok=True)
-
-            sb = get_supabase()
-            synced, already_present, failed = [], [], []
-
-            for r in all_rows:
-                for path_field, kind in [("receipt_path", "receipt"), ("proof_of_payment_path", "proof")]:
-                    storage_path = r.get(path_field)
-                    if not storage_path:
-                        continue
-                    ext = Path(storage_path).suffix or ".bin"
-                    fn = f"PV-{r['id']:05d}_{kind}{ext}"
-                    local_path = os.path.join(local_folder, fn)
-                    if os.path.exists(local_path):
-                        already_present.append(fn)
-                        continue
-                    try:
-                        file_bytes = sb.storage.from_(PAYMENT_BUCKET).download(storage_path)
-                        with open(local_path, "wb") as _f:
-                            _f.write(file_bytes)
-                        synced.append(fn)
-                    except Exception as e:
-                        failed.append(f"{fn} — {e}")
-
-            if synced:
-                st.success(f"✅ Synced {len(synced)} file(s): " + ", ".join(synced))
-            if already_present:
-                st.caption(f"Already present locally: {len(already_present)} file(s) — skipped.")
-            if failed:
-                st.warning("Some files couldn't be synced:\n" + "\n".join(failed))
-            if not synced and not already_present and not failed:
-                st.info("No payment attachments found in the database yet.")
-
     st.markdown('</div>', unsafe_allow_html=True)
 
 
@@ -3465,3 +2779,331 @@ if import_mode == "true":
         st.success(f"✅ Imported {imported} personal expense entries!")
 
     st.warning("⚠️ Only import once! Importing again will create duplicate entries.")
+
+# ══════════════════════════════════════════════
+# TAB 9 — PAYMENTS & VOUCHERS
+# ══════════════════════════════════════════════
+PAYMENT_STATUSES = ["Pending", "Paid", "Partial", "Cancelled"]
+PAYMENT_TYPES    = [
+    "Property Manager Reimbursable",
+    "Property Management Fee (Archmedia Sdn Bhd)",
+    "Supplier / Vendor Payment",
+    "Utility Bill",
+    "Housekeeping & Laundry",
+    "Pool Maintenance",
+    "Maintenance & Repairs",
+    "Contractor Payment",
+    "Other",
+]
+STATUS_ICONS = {
+    "Pending":   "🟡",
+    "Paid":      "🟢",
+    "Partial":   "🔵",
+    "Cancelled": "⚫",
+}
+
+def generate_voucher_number(year, month):
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT id FROM payments WHERE year=? AND month=? ORDER BY id",
+        (year, month)
+    ).fetchall()
+    conn.close()
+    seq = len(rows) + 1
+    return f"PV-{year}-{month:02d}-{seq:03d}"
+
+def generate_payment_voucher_pdf(payment: dict) -> bytes:
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4,
+        rightMargin=20*mm, leftMargin=20*mm,
+        topMargin=18*mm, bottomMargin=18*mm)
+    INK   = colors.HexColor("#1C1C1A")
+    GREEN = colors.HexColor("#2a3528")
+    LIGHT = colors.HexColor("#E5DDD0")
+    RED   = colors.HexColor("#CC0000")
+    W = A4[0] - 40*mm
+    sN  = ParagraphStyle("n",  fontName="Helvetica",      fontSize=10, leading=14, textColor=INK)
+    sB  = ParagraphStyle("b",  fontName="Helvetica-Bold", fontSize=10, leading=14, textColor=INK)
+    sS  = ParagraphStyle("s",  fontName="Helvetica",      fontSize=8,  leading=11, textColor=colors.HexColor("#6B6560"))
+    sT  = ParagraphStyle("t",  fontName="Helvetica-Bold", fontSize=18, leading=22, textColor=INK)
+    sSub= ParagraphStyle("su", fontName="Helvetica-Bold", fontSize=11, leading=14, textColor=GREEN)
+    sCan= ParagraphStyle("c",  fontName="Helvetica-Bold", fontSize=22, alignment=TA_CENTER, textColor=RED)
+    sCanR=ParagraphStyle("cr", fontName="Helvetica-Bold", fontSize=11, alignment=TA_CENTER, textColor=RED)
+    is_cancelled  = payment.get("status","") == "Cancelled"
+    cancel_reason = payment.get("cancellation_reason","") or ""
+    story = []
+    story.append(Paragraph("ULU Mahsuri Villa", sT))
+    story.append(Paragraph("Payment Voucher", sSub))
+    story.append(HRFlowable(width="100%", thickness=2, color=GREEN, spaceAfter=10))
+    if is_cancelled:
+        story.append(Paragraph("CANCELLED", sCan))
+        if cancel_reason:
+            story.append(Paragraph(f"Reason: {cancel_reason}", sCanR))
+        story.append(Spacer(1, 8))
+        story.append(HRFlowable(width="100%", thickness=1, color=RED, spaceAfter=8))
+    month_val = payment.get("month", 1)
+    try:
+        month_label = MONTHS[int(month_val)-1]
+    except:
+        month_label = str(month_val)
+    details = [
+        ["Voucher No.", payment.get("voucher_no","—"),   "Date",    payment.get("payment_date","—")],
+        ["Payee",       payment.get("payee","—"),         "Month",   f"{month_label} {payment.get('year','—')}"],
+        ["Type",        payment.get("payment_type","—"), "Method",  payment.get("payment_method","—")],
+        ["Bank",        payment.get("payee_bank","—"),   "Acc No.", payment.get("payee_account","—")],
+        ["Reference",   payment.get("payment_ref","—"),  "Status",  payment.get("status","—")],
+    ]
+    det_tbl = Table(details, colWidths=[W*0.18, W*0.32, W*0.18, W*0.32])
+    det_tbl.setStyle(TableStyle([
+        ("FONTNAME",(0,0),(-1,-1),"Helvetica"),
+        ("FONTNAME",(0,0),(0,-1),"Helvetica-Bold"),
+        ("FONTNAME",(2,0),(2,-1),"Helvetica-Bold"),
+        ("FONTSIZE",(0,0),(-1,-1),9),
+        ("TEXTCOLOR",(0,0),(-1,-1),INK),
+        ("TOPPADDING",(0,0),(-1,-1),5),
+        ("BOTTOMPADDING",(0,0),(-1,-1),5),
+        ("LINEBELOW",(0,0),(-1,-1),0.3,LIGHT),
+    ]))
+    story.append(det_tbl)
+    story.append(Spacer(1, 12))
+    story.append(Paragraph("Description / Purpose:", sB))
+    story.append(Paragraph(payment.get("description","—") or "—", sN))
+    story.append(Spacer(1, 12))
+    bg_col = colors.HexColor("#888") if is_cancelled else GREEN
+    amt_tbl = Table(
+        [["Amount (MYR)", f"RM {float(payment.get('amount',0) or 0):,.2f}"]],
+        colWidths=[W*0.6, W*0.4]
+    )
+    amt_tbl.setStyle(TableStyle([
+        ("BACKGROUND",(0,0),(-1,-1),bg_col),
+        ("TEXTCOLOR",(0,0),(-1,-1),colors.white),
+        ("FONTNAME",(0,0),(-1,-1),"Helvetica-Bold"),
+        ("FONTSIZE",(0,0),(-1,-1),13),
+        ("ALIGN",(1,0),(1,0),"RIGHT"),
+        ("TOPPADDING",(0,0),(-1,-1),10),
+        ("BOTTOMPADDING",(0,0),(-1,-1),10),
+        ("LEFTPADDING",(0,0),(-1,-1),12),
+        ("RIGHTPADDING",(0,0),(-1,-1),12),
+    ]))
+    story.append(amt_tbl)
+    if is_cancelled and cancel_reason:
+        story.append(Spacer(1, 6))
+        story.append(Paragraph(f"Cancellation reason: {cancel_reason}", sCanR))
+    story.append(Spacer(1, 16))
+    story.append(HRFlowable(width="100%", thickness=0.5, color=LIGHT, spaceAfter=8))
+    story.append(Paragraph(
+        f"ULU Mahsuri Villa · Generated {datetime.datetime.now().strftime('%d %B %Y %H:%M')}",
+        sS
+    ))
+    doc.build(story)
+    buf.seek(0)
+    return buf.getvalue()
+
+with tab9:
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown('<p class="card-title">💳 Payments & Vouchers</p>', unsafe_allow_html=True)
+    st.markdown("Record payments to vendors, Property Manager reimbursables, and Archmedia Sdn Bhd management fees. Generate PDF payment vouchers for each transaction.")
+
+    pv_subtab1, pv_subtab2 = st.tabs(["➕ New Payment", "📋 All Payment Records"])
+
+    with pv_subtab1:
+        ym_list_pv = get_year_month_list()
+        ym_labels_pv = [f"{MONTHS[m-1]} {y} ({operation_year(y,m)})" for y,m in ym_list_pv]
+        sel_idx_pv = st.selectbox(
+            "Assign payment to month",
+            range(len(ym_labels_pv)),
+            format_func=lambda i: ym_labels_pv[i],
+            key="pv_month"
+        )
+        pv_year, pv_month = ym_list_pv[sel_idx_pv]
+
+        col_a, col_b = st.columns(2, gap="large")
+        with col_a:
+            pv_payee      = st.text_input("Payee Name", placeholder="e.g. Archmedia Sdn Bhd / Qasim Bin Ismail", key="pv_payee")
+            pv_type       = st.selectbox("Payment Type", PAYMENT_TYPES, key="pv_type")
+            pv_desc       = st.text_area("Description / Purpose", height=80,
+                                placeholder="e.g. Property Management Fee for June 2026", key="pv_desc")
+            pv_amount     = st.number_input("Amount (RM)", min_value=0.0, step=10.0, format="%.2f", key="pv_amount")
+            pv_date       = st.text_input("Payment Date (YYYY-MM-DD)",
+                                value=datetime.date.today().isoformat(), key="pv_date")
+        with col_b:
+            pv_method     = st.selectbox("Payment Method",
+                ["Bank Transfer","Cash","Cheque","Online Banking","Other"], key="pv_method")
+            pv_ref        = st.text_input("Payment Reference / Transaction ID",
+                                placeholder="e.g. IBG20260705001", key="pv_ref")
+            pv_payee_bank = st.text_input("Payee Bank", placeholder="e.g. Maybank / CIMB / RHB", key="pv_bank")
+            pv_payee_acc  = st.text_input("Payee Account No.", placeholder="e.g. 1234567890", key="pv_acc")
+            pv_notes      = st.text_area("Notes", height=60, key="pv_notes")
+
+        if st.button("💾 Save Payment & Generate Voucher", type="primary", key="btn_save_pv"):
+            if not pv_payee or pv_amount <= 0:
+                st.error("Payee name and amount are required.")
+            else:
+                voucher_no = generate_voucher_number(pv_year, pv_month)
+                conn = get_db()
+                conn.execute(
+                    """INSERT INTO payments
+                       (year,month,voucher_no,payee,payment_type,description,amount,
+                        payment_date,payment_method,payment_ref,payee_bank,payee_account,
+                        notes,status)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (pv_year, pv_month, voucher_no, pv_payee, pv_type, pv_desc,
+                     pv_amount, pv_date, pv_method, pv_ref, pv_payee_bank,
+                     pv_payee_acc, pv_notes, "Pending")
+                )
+                conn.commit(); conn.close()
+                payment_dict = {
+                    "voucher_no": voucher_no, "year": pv_year, "month": pv_month,
+                    "payee": pv_payee, "payment_type": pv_type, "description": pv_desc,
+                    "amount": pv_amount, "payment_date": pv_date, "payment_method": pv_method,
+                    "payment_ref": pv_ref, "payee_bank": pv_payee_bank,
+                    "payee_account": pv_payee_acc, "status": "Pending", "cancellation_reason": ""
+                }
+                pdf_bytes = generate_payment_voucher_pdf(payment_dict)
+                st.success(f"Payment saved. Voucher: **{voucher_no}**")
+                st.download_button(
+                    f"Download {voucher_no}.pdf",
+                    data=pdf_bytes,
+                    file_name=f"{voucher_no}.pdf",
+                    mime="application/pdf",
+                    key=f"dl_new_{voucher_no}"
+                )
+                st.rerun()
+
+    with pv_subtab2:
+        pf1, pf2, pf3 = st.columns(3)
+        filter_year   = pf1.selectbox("Year",  list(range(datetime.datetime.now().year, 2023, -1)), key="pv_filter_yr")
+        filter_month  = pf2.selectbox("Month", ["All"] + MONTHS, key="pv_filter_mo")
+        filter_status = pf3.selectbox("Status", ["All"] + PAYMENT_STATUSES, key="pv_filter_st")
+
+        conn = get_db()
+        if filter_month == "All":
+            pv_rows = conn.execute(
+                "SELECT * FROM payments WHERE year=? ORDER BY month DESC, id DESC",
+                (filter_year,)
+            ).fetchall()
+        else:
+            mo_num = MONTHS.index(filter_month) + 1
+            pv_rows = conn.execute(
+                "SELECT * FROM payments WHERE year=? AND month=? ORDER BY id DESC",
+                (filter_year, mo_num)
+            ).fetchall()
+        conn.close()
+
+        if filter_status != "All":
+            pv_rows = [r for r in pv_rows if r.get("status","") == filter_status]
+
+        active_rows   = [r for r in pv_rows if r.get("status","") != "Cancelled"]
+        total_amount  = sum(float(r.get("amount",0) or 0) for r in active_rows)
+        paid_rows     = [r for r in active_rows if r.get("status","") == "Paid"]
+        total_paid    = sum(float(r.get("amount",0) or 0) for r in paid_rows)
+        total_pending = total_amount - total_paid
+
+        mc1, mc2, mc3, mc4 = st.columns(4)
+        mc1.metric("Total Records", len(pv_rows))
+        mc2.metric("Total Due (excl. cancelled)", fmt_myr(total_amount))
+        mc3.metric("Total Paid", fmt_myr(total_paid))
+        mc4.metric("Outstanding", fmt_myr(total_pending))
+        st.divider()
+
+        if not pv_rows:
+            st.info("No payment records for this period.")
+        else:
+            for r in [dict(r) for r in pv_rows]:
+                r_id        = r.get("id")
+                r_status    = r.get("status","Pending")
+                r_icon      = STATUS_ICONS.get(r_status, "⚪")
+                is_canc     = r_status == "Cancelled"
+                canc_reason = r.get("cancellation_reason","") or ""
+
+                header_label = f"{r_icon} **{r.get('voucher_no','—')}** — {r.get('payee','—')} — {fmt_myr(r.get('amount',0))}"
+                if is_canc:
+                    header_label += " *(Cancelled)*"
+
+                with st.expander(header_label, expanded=False):
+                    if is_canc and canc_reason:
+                        st.warning(f"🚫 Cancelled — Reason: {canc_reason}")
+
+                    d1, d2, d3 = st.columns(3)
+                    d1.markdown(f"**Date:** {r.get('payment_date','—')}")
+                    d2.markdown(f"**Month:** {MONTHS[int(r.get('month',1))-1]} {r.get('year','—')}")
+                    d3.markdown(f"**Type:** {r.get('payment_type','—')}")
+                    d4, d5, d6 = st.columns(3)
+                    d4.markdown(f"**Method:** {r.get('payment_method','—')}")
+                    d5.markdown(f"**Ref:** {r.get('payment_ref','—')}")
+                    d6.markdown(f"**Bank:** {r.get('payee_bank','—')} / {r.get('payee_account','—')}")
+                    st.markdown(f"**Description:** {r.get('description','—')}")
+                    if r.get("notes"):
+                        st.markdown(f"**Notes:** {r.get('notes','')}")
+
+                    st.divider()
+                    act1, act2, act3, act4 = st.columns([2, 1, 2, 2])
+
+                    if not is_canc:
+                        new_status = act1.selectbox(
+                            "Status",
+                            [s for s in PAYMENT_STATUSES if s != "Cancelled"],
+                            index=[s for s in PAYMENT_STATUSES if s != "Cancelled"].index(r_status)
+                            if r_status in PAYMENT_STATUSES and r_status != "Cancelled" else 0,
+                            key=f"pv_status_{r_id}",
+                            label_visibility="collapsed"
+                        )
+                        if act2.button("Update", key=f"pv_upd_{r_id}"):
+                            conn = get_db()
+                            conn.execute("UPDATE payments SET status=? WHERE id=?",
+                                         (new_status, r_id))
+                            conn.commit(); conn.close()
+                            st.rerun()
+                    else:
+                        act1.markdown("<span class='badge-cancelled'>⚫ Cancelled</span>", unsafe_allow_html=True)
+
+                    # Download voucher PDF
+                    pdf_bytes = generate_payment_voucher_pdf(r)
+                    suffix = "_CANCELLED" if is_canc else ""
+                    act3.download_button(
+                        "⬇️ Voucher PDF",
+                        data=pdf_bytes,
+                        file_name=f"{r.get('voucher_no','voucher')}{suffix}.pdf",
+                        mime="application/pdf",
+                        key=f"dl_pv_{r_id}"
+                    )
+
+                    # Cancel / Delete buttons
+                    if not is_canc:
+                        if act4.button("🚫 Cancel Record", key=f"pv_cancel_btn_{r_id}"):
+                            st.session_state[f"show_cancel_{r_id}"] = True
+                    else:
+                        if act4.button("🗑️ Delete", key=f"pv_del_{r_id}"):
+                            conn = get_db()
+                            conn.execute("DELETE FROM payments WHERE id=?", (r_id,))
+                            conn.commit(); conn.close()
+                            st.rerun()
+
+                    # Cancel flow
+                    if st.session_state.get(f"show_cancel_{r_id}"):
+                        st.markdown("---")
+                        st.error("**Cancel this payment record — this cannot be undone.**")
+                        cancel_input = st.text_input(
+                            "Reason for cancellation (required)",
+                            key=f"cancel_reason_{r_id}",
+                            placeholder="e.g. Duplicate entry / Wrong amount / Payment reversed"
+                        )
+                        cc1, cc2 = st.columns(2)
+                        if cc1.button("Confirm Cancellation", key=f"cancel_confirm_{r_id}", type="primary"):
+                            if not cancel_input.strip():
+                                st.error("A reason is required before confirming cancellation.")
+                            else:
+                                conn = get_db()
+                                conn.execute(
+                                    "UPDATE payments SET status='Cancelled', cancellation_reason=? WHERE id=?",
+                                    (cancel_input.strip(), r_id)
+                                )
+                                conn.commit(); conn.close()
+                                st.session_state.pop(f"show_cancel_{r_id}", None)
+                                st.success("Record cancelled and reason recorded.")
+                                st.rerun()
+                        if cc2.button("Back", key=f"cancel_back_{r_id}"):
+                            st.session_state.pop(f"show_cancel_{r_id}", None)
+                            st.rerun()
+
+    st.markdown('</div>', unsafe_allow_html=True)
