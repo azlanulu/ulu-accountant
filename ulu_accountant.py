@@ -1971,14 +1971,29 @@ Return ONLY the JSON."""
             if not cx_desc.strip() or cx_amount <= 0:
                 st.error("Description and amount are required.")
             else:
-                # In cloud mode, store file as base64 in notes or skip local save
-                # receipt_path stored as filename only (no local disk on Streamlit Cloud)
-                receipt_path = ""
+                receipt_path   = ""
                 file_name_save = ""
+
                 if st.session_state.get("capex_bytes"):
                     vendor_clean   = (cx_vendor or "Unknown").replace("/","_")[:20]
                     file_name_save = f"{cx_date}_{vendor_clean}_{st.session_state.get('capex_name','receipt')}"
-                    receipt_path   = file_name_save  # store filename only; local disk not reliable on cloud
+
+                    # Detect if running locally (not on Streamlit Cloud)
+                    is_cloud = os.environ.get("STREAMLIT_SHARING_MODE") or \
+                               os.environ.get("HOME","").startswith("/home/appuser") or \
+                               "/mount/src" in os.path.abspath(__file__)
+
+                    if not is_cloud:
+                        # Local — save to CapEx Receipts folder
+                        scan_folder = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                   "CapEx Receipts")
+                        os.makedirs(scan_folder, exist_ok=True)
+                        receipt_path = os.path.join(scan_folder, file_name_save)
+                        with open(receipt_path, "wb") as _f:
+                            _f.write(st.session_state["capex_bytes"])
+                    else:
+                        # Cloud — store filename only, no local disk
+                        receipt_path = file_name_save
 
                 conn = get_db()
                 db_error = None
@@ -1998,7 +2013,6 @@ Return ONLY the JSON."""
                     st.error(f"❌ Save failed — database error: {db_error}")
                     st.info("Tip: Check Supabase dashboard → capex_items table to confirm columns exist.")
                 else:
-                    # Clear session state only on success
                     for k in ["capex_bytes","capex_name","capex_vendor","capex_desc",
                               "capex_amount","capex_date","capex_cat","capex_upload_name"]:
                         st.session_state.pop(k, None)
