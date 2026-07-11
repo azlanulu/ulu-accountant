@@ -93,7 +93,12 @@ class SupabaseCursor:
                 self._handle_delete(sql, p)
 
         except Exception as e:
-            st.error(f"DB error: {e}\nSQL: {sql}\nParams: {p}")
+            # Re-raise so callers can catch and surface the real error.
+            # Only show st.error for SELECT failures (non-fatal reads).
+            if sql.upper().startswith("SELECT"):
+                st.error(f"DB read error: {e}\nSQL: {sql}\nParams: {p}")
+            else:
+                raise  # Let INSERT/UPDATE/DELETE callers handle and display
 
     def _table_from_sql(self, sql):
         import re
@@ -1966,31 +1971,39 @@ Return ONLY the JSON."""
             if not cx_desc.strip() or cx_amount <= 0:
                 st.error("Description and amount are required.")
             else:
-                # Save scan file if uploaded
-                scan_path = ""
+                # In cloud mode, store file as base64 in notes or skip local save
+                # receipt_path stored as filename only (no local disk on Streamlit Cloud)
+                receipt_path = ""
+                file_name_save = ""
                 if st.session_state.get("capex_bytes"):
-                    scan_folder = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                               "CapEx Receipts")
-                    os.makedirs(scan_folder, exist_ok=True)
-                    vendor_clean = (cx_vendor or "Unknown").replace("/","_")[:20]
-                    fname_save   = f"{cx_date}_{vendor_clean}_{st.session_state.get('capex_name','receipt')}"
-                    scan_path    = os.path.join(scan_folder, fname_save)
-                    with open(scan_path, "wb") as _f:
-                        _f.write(st.session_state["capex_bytes"])
+                    vendor_clean   = (cx_vendor or "Unknown").replace("/","_")[:20]
+                    file_name_save = f"{cx_date}_{vendor_clean}_{st.session_state.get('capex_name','receipt')}"
+                    receipt_path   = file_name_save  # store filename only; local disk not reliable on cloud
 
                 conn = get_db()
-                conn.execute("""INSERT INTO capex_items
-                    (purchase_date,vendor,description,category,amount,useful_life_years,scan_path,notes)
-                    VALUES (?,?,?,?,?,?,?,?)""",
-                    (cx_date, cx_vendor, cx_desc.strip(), cx_cat,
-                     cx_amount, cx_life, scan_path, cx_notes))
-                conn.commit(); conn.close()
-                # Clear session state
-                for k in ["capex_bytes","capex_name","capex_vendor","capex_desc",
-                          "capex_amount","capex_date","capex_cat"]:
-                    st.session_state.pop(k, None)
-                st.success("✓ CapEx item saved.")
-                st.rerun()
+                db_error = None
+                try:
+                    conn.execute("""INSERT INTO capex_items
+                        (purchase_date,vendor,description,category,amount,useful_life_years,file_name,receipt_path,notes)
+                        VALUES (?,?,?,?,?,?,?,?,?)""",
+                        (cx_date, cx_vendor, cx_desc.strip(), cx_cat,
+                         cx_amount, cx_life, file_name_save, receipt_path, cx_notes))
+                    conn.commit()
+                except Exception as e:
+                    db_error = str(e)
+                finally:
+                    conn.close()
+
+                if db_error:
+                    st.error(f"❌ Save failed — database error: {db_error}")
+                    st.info("Tip: Check Supabase dashboard → capex_items table to confirm columns exist.")
+                else:
+                    # Clear session state only on success
+                    for k in ["capex_bytes","capex_name","capex_vendor","capex_desc",
+                              "capex_amount","capex_date","capex_cat","capex_upload_name"]:
+                        st.session_state.pop(k, None)
+                    st.success("✓ CapEx item saved.")
+                    st.rerun()
 
     with capex_view:
         conn = get_db()
@@ -2015,16 +2028,16 @@ Return ONLY the JSON."""
             st.dataframe(pd.DataFrame(cat_rows), use_container_width=True, hide_index=True)
             st.divider()
 
-            # Full list with delete and scan download
+            # Full list with delete
             st.subheader("All CapEx Items")
             for r in [dict(r) for r in capex_rows]:
                 rc1,rc2,rc3,rc4,rc5,rc6 = st.columns([2,3,2,2,1,1])
-                rc1.caption(r.get("purchase_date",""))
-                rc2.caption(r.get("description","")[:40])
-                rc3.caption(r.get("category","")[:25])
-                rc4.caption(fmt_myr(r.get("amount",0)))
-                # Scan download
-                sp = r.get("scan_path","")
+                rc1.markdown(f"<span style='color:#1C1C1A;font-size:0.9rem'>{r.get('purchase_date','')}</span>", unsafe_allow_html=True)
+                rc2.markdown(f"<span style='color:#1C1C1A;font-size:0.9rem'>{(r.get('description','') or '')[:40]}</span>", unsafe_allow_html=True)
+                rc3.markdown(f"<span style='color:#1C1C1A;font-size:0.9rem'>{(r.get('category','') or '')[:25]}</span>", unsafe_allow_html=True)
+                rc4.markdown(f"<span style='color:#1C1C1A;font-size:0.9rem;font-weight:600'>{fmt_myr(r.get('amount',0))}</span>", unsafe_allow_html=True)
+                # Receipt file — use file_name or receipt_path
+                sp = r.get("receipt_path","") or r.get("scan_path","") or r.get("file_name","")
                 if sp and os.path.exists(sp):
                     with open(sp,"rb") as _f:
                         ext = sp.split(".")[-1].lower()
@@ -2032,6 +2045,8 @@ Return ONLY the JSON."""
                         rc5.download_button("📎", data=_f.read(),
                             file_name=os.path.basename(sp), mime=mime,
                             key=f"cx_dl_{r['id']}")
+                elif sp:
+                    rc5.caption("📎")  # file recorded but not on this machine
                 else:
                     rc5.caption("—")
                 if rc6.button("🗑", key=f"cx_del_{r['id']}"):
