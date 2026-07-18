@@ -3438,42 +3438,37 @@ with tab10:
         all_di = conn.execute(
             "SELECT * FROM direct_income ORDER BY year, month", ()
         ).fetchall()
-        # Get Airbnb-only bookings (source=AIRBNB) per month
-        all_bk_airbnb = conn.execute(
-            "SELECT year, month, SUM(amount) as total FROM bookings WHERE source='AIRBNB' GROUP BY year, month", ()
-        ).fetchall()
-        # Get all bookings per month (includes Direct)
-        all_bk_all = conn.execute(
-            "SELECT year, month, SUM(amount) as total FROM bookings GROUP BY year, month", ()
+        # Fetch ALL bookings — group in Python to avoid adapter GROUP BY issues
+        all_bk_rows = conn.execute(
+            "SELECT year, month, source, amount FROM bookings", ()
         ).fetchall()
         conn.close()
 
         if not all_di:
             st.info("No direct income entries yet. Upload an Airbnb CSV via Tab 2 → Airbnb CSV & Reconcile.")
         else:
-            # Build lookups
+            # Build monthly lookups in Python
             monthly_di = {}
             for r in all_di:
                 key = (int(r.get("year",0)), int(r.get("month",0)))
                 monthly_di[key] = monthly_di.get(key, 0) + float(r.get("amount",0) or 0)
 
-            monthly_bk_airbnb = {}
-            for r in all_bk_airbnb:
+            monthly_bk_airbnb = {}  # Airbnb-only per month
+            monthly_bk_all    = {}  # All bookings per month
+            for r in all_bk_rows:
                 key = (int(r.get("year",0)), int(r.get("month",0)))
-                monthly_bk_airbnb[key] = float(r.get("total",0) or 0)
+                amt = float(r.get("amount",0) or 0)
+                monthly_bk_all[key] = monthly_bk_all.get(key, 0) + amt
+                if (r.get("source","") or "").upper() == "AIRBNB":
+                    monthly_bk_airbnb[key] = monthly_bk_airbnb.get(key, 0) + amt
 
-            monthly_bk_all = {}
-            for r in all_bk_all:
-                key = (int(r.get("year",0)), int(r.get("month",0)))
-                monthly_bk_all[key] = float(r.get("total",0) or 0)
-
-            total_direct  = sum(monthly_di.values())
-            total_airbnb  = sum(monthly_bk_airbnb.values())
-            total_combined= sum(monthly_bk_all.values())
+            total_direct   = sum(monthly_di.values())
+            total_airbnb   = sum(monthly_bk_airbnb.values())
+            total_combined = sum(monthly_bk_all.values())
 
             at1, at2, at3, at4 = st.columns(4)
-            at1.metric("Airbnb Income", fmt_myr(total_airbnb))
-            at2.metric("Direct/Extras", fmt_myr(total_direct))
+            at1.metric("Airbnb Income",  fmt_myr(total_airbnb))
+            at2.metric("Direct/Extras",  fmt_myr(total_direct))
             at3.metric("Combined Total", fmt_myr(total_combined))
             at4.metric("Direct %",
                 f"{total_direct/total_combined*100:.1f}%"
@@ -3496,12 +3491,12 @@ with tab10:
 
             st.divider()
 
-            # Monthly trend — use source=AIRBNB from bookings table
+            # Monthly trend
             st.markdown("**Monthly Summary — Airbnb vs Direct/Extras:**")
             trend_rows = []
             for (yr, mo), direct_amt in sorted(monthly_di.items()):
-                airbnb_mo  = monthly_bk_airbnb.get((yr, mo), 0)
-                combined_mo= monthly_bk_all.get((yr, mo), 0)
+                airbnb_mo   = monthly_bk_airbnb.get((yr, mo), 0)
+                combined_mo = monthly_bk_all.get((yr, mo), 0)
                 pct = direct_amt/combined_mo*100 if combined_mo > 0 else 0
                 trend_rows.append({
                     "Month":              f"{MONTHS[mo-1]} {yr}",
