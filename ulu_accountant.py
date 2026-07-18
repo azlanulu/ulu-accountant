@@ -3438,28 +3438,50 @@ with tab10:
         all_di = conn.execute(
             "SELECT * FROM direct_income ORDER BY year, month", ()
         ).fetchall()
-        all_bk = conn.execute(
+        # Get Airbnb-only bookings (source=AIRBNB) per month
+        all_bk_airbnb = conn.execute(
+            "SELECT year, month, SUM(amount) as total FROM bookings WHERE source='AIRBNB' GROUP BY year, month", ()
+        ).fetchall()
+        # Get all bookings per month (includes Direct)
+        all_bk_all = conn.execute(
             "SELECT year, month, SUM(amount) as total FROM bookings GROUP BY year, month", ()
         ).fetchall()
         conn.close()
 
         if not all_di:
-            st.info("No direct income entries yet. Upload an Airbnb CSV in the '📥 Upload & Reconcile' tab.")
+            st.info("No direct income entries yet. Upload an Airbnb CSV via Tab 2 → Airbnb CSV & Reconcile.")
         else:
-            total_direct    = sum(float(r.get("amount",0) or 0) for r in all_di)
-            total_airbnb_bk = sum(float(r.get("total",0) or 0) for r in all_bk)
+            # Build lookups
+            monthly_di = {}
+            for r in all_di:
+                key = (int(r.get("year",0)), int(r.get("month",0)))
+                monthly_di[key] = monthly_di.get(key, 0) + float(r.get("amount",0) or 0)
+
+            monthly_bk_airbnb = {}
+            for r in all_bk_airbnb:
+                key = (int(r.get("year",0)), int(r.get("month",0)))
+                monthly_bk_airbnb[key] = float(r.get("total",0) or 0)
+
+            monthly_bk_all = {}
+            for r in all_bk_all:
+                key = (int(r.get("year",0)), int(r.get("month",0)))
+                monthly_bk_all[key] = float(r.get("total",0) or 0)
+
+            total_direct  = sum(monthly_di.values())
+            total_airbnb  = sum(monthly_bk_airbnb.values())
+            total_combined= sum(monthly_bk_all.values())
 
             at1, at2, at3, at4 = st.columns(4)
-            at1.metric("Airbnb Income (DB)", fmt_myr(total_airbnb_bk))
+            at1.metric("Airbnb Income", fmt_myr(total_airbnb))
             at2.metric("Direct/Extras", fmt_myr(total_direct))
-            at3.metric("Combined Total", fmt_myr(total_airbnb_bk + total_direct))
+            at3.metric("Combined Total", fmt_myr(total_combined))
             at4.metric("Direct %",
-                f"{total_direct/(total_airbnb_bk+total_direct)*100:.1f}%"
-                if (total_airbnb_bk + total_direct) > 0 else "—")
+                f"{total_direct/total_combined*100:.1f}%"
+                if total_combined > 0 else "—")
 
             st.divider()
 
-            # By type
+            # By type breakdown
             st.markdown("**Breakdown by Income Type:**")
             type_totals = {}
             for r in all_di:
@@ -3474,24 +3496,18 @@ with tab10:
 
             st.divider()
 
-            # Monthly trend
+            # Monthly trend — use source=AIRBNB from bookings table
             st.markdown("**Monthly Summary — Airbnb vs Direct/Extras:**")
-            monthly_di = {}
-            for r in all_di:
-                key = (int(r.get("year",0)), int(r.get("month",0)))
-                monthly_di[key] = monthly_di.get(key, 0) + float(r.get("amount",0) or 0)
-
             trend_rows = []
-            for (yr, mo), amt in sorted(monthly_di.items()):
-                ab_mo = next((float(r.get("total",0)) for r in all_bk
-                              if int(r.get("year",0))==yr and int(r.get("month",0))==mo), 0)
-                combined = ab_mo + amt
-                pct = amt/combined*100 if combined > 0 else 0
+            for (yr, mo), direct_amt in sorted(monthly_di.items()):
+                airbnb_mo  = monthly_bk_airbnb.get((yr, mo), 0)
+                combined_mo= monthly_bk_all.get((yr, mo), 0)
+                pct = direct_amt/combined_mo*100 if combined_mo > 0 else 0
                 trend_rows.append({
                     "Month":              f"{MONTHS[mo-1]} {yr}",
-                    "Airbnb (RM)":        fmt_myr(ab_mo),
-                    "Direct/Extras (RM)": fmt_myr(amt),
-                    "Combined (RM)":      fmt_myr(combined),
+                    "Airbnb (RM)":        fmt_myr(airbnb_mo),
+                    "Direct/Extras (RM)": fmt_myr(direct_amt),
+                    "Combined (RM)":      fmt_myr(combined_mo),
                     "Direct %":           f"{pct:.1f}%",
                 })
             if trend_rows:
