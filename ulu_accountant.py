@@ -3093,6 +3093,7 @@ with tab9:
 
     st.markdown('</div>', unsafe_allow_html=True)
 
+
 # ══════════════════════════════════════════════
 # TAB 10 — DIRECT INCOME & EXTRAS
 # ══════════════════════════════════════════════
@@ -3106,82 +3107,298 @@ DIRECT_INCOME_TYPES = [
     "Other Extra Charge",
 ]
 
+def parse_airbnb_csv(file_bytes: bytes) -> list:
+    """Parse Airbnb CSV export and return list of reservation dicts."""
+    import csv, io
+    text = file_bytes.decode("utf-8-sig")
+    reader = csv.DictReader(io.StringIO(text))
+    reservations = []
+    for row in reader:
+        if row.get("Type","").strip() == "Reservation":
+            try:
+                reservations.append({
+                    "confirmation": row.get("Confirmation code","").strip(),
+                    "guest":        row.get("Guest","").strip(),
+                    "checkin":      row.get("Start date","").strip(),
+                    "checkout":     row.get("End date","").strip(),
+                    "nights":       int(float(row.get("Nights",0) or 0)),
+                    "payout":       float(row.get("Amount",0) or 0),
+                    "gross":        float(row.get("Gross earnings",0) or 0),
+                    "service_fee":  float(row.get("Service fee",0) or 0),
+                    "currency":     row.get("Currency","MYR").strip(),
+                })
+            except Exception:
+                pass
+    return reservations
+
+def reconcile_airbnb_vs_manager(airbnb_rows: list, db_bookings: list) -> dict:
+    """
+    Compare Airbnb CSV bookings vs manager DB bookings for same month.
+    Returns dict with matched, direct/extras, and summary.
+    """
+    # Build lookup of DB bookings by guest name (normalised)
+    def norm(s): return (s or "").upper().strip().split()[0]  # first word match
+
+    db_lookup = {}
+    for b in db_bookings:
+        key = norm(b.get("guest_name",""))
+        if key not in db_lookup:
+            db_lookup[key] = []
+        db_lookup[key].append(b)
+
+    airbnb_names = {norm(r["guest"]) for r in airbnb_rows}
+    db_names     = set(db_lookup.keys())
+
+    matched  = []
+    directs  = []
+
+    # Airbnb guests matched in DB
+    for r in airbnb_rows:
+        key = norm(r["guest"])
+        if key in db_names:
+            db_match = db_lookup[key][0]
+            matched.append({
+                "guest":        r["guest"],
+                "checkin":      r["checkin"],
+                "checkout":     r["checkout"],
+                "nights":       r["nights"],
+                "airbnb_payout":r["payout"],
+                "airbnb_gross": r["gross"],
+                "db_amount":    float(db_match.get("amount",0) or 0),
+                "confirmation": r["confirmation"],
+                "amount_diff":  float(db_match.get("amount",0) or 0) - r["payout"],
+            })
+        # else: in Airbnb but not in DB — cross-month (checkout next month)
+
+    # DB bookings NOT in Airbnb CSV = Direct/Extras
+    for b in db_bookings:
+        key = norm(b.get("guest_name",""))
+        if key not in airbnb_names:
+            directs.append({
+                "guest":    b.get("guest_name",""),
+                "checkin":  b.get("checkin",""),
+                "checkout": b.get("checkout",""),
+                "nights":   int(b.get("nights",0) or 0),
+                "amount":   float(b.get("amount",0) or 0),
+                "source":   b.get("source",""),
+                "db_id":    b.get("id"),
+            })
+
+    airbnb_total = sum(r["payout"] for r in airbnb_rows)
+    db_total     = sum(float(b.get("amount",0) or 0) for b in db_bookings)
+    direct_total = sum(d["amount"] for d in directs)
+
+    return {
+        "matched":       matched,
+        "directs":       directs,
+        "airbnb_total":  airbnb_total,
+        "db_total":      db_total,
+        "direct_total":  direct_total,
+        "difference":    db_total - airbnb_total,
+    }
+
 with tab10:
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.markdown('<p class="card-title">💰 Direct Income & Extras</p>', unsafe_allow_html=True)
     st.markdown(
-        "Supplementary register for income received outside Airbnb — direct bookings, "
-        "cash payments, extra charges. **This does not affect the P&L** (already included "
-        "in Manager's Monthly Report). Used for reconciliation and audit trail only."
+        "Upload the Airbnb monthly CSV — the app automatically compares it against "
+        "the Manager's report already in the database and identifies Direct bookings "
+        "and Extra charges. **Supplementary register only — does not affect P&L.**"
     )
 
     di_subtab1, di_subtab2, di_subtab3 = st.tabs([
-        "➕ Add Entry", "📋 All Records", "📊 Dashboard"
+        "📥 Upload & Reconcile", "📋 All Records", "📊 Dashboard"
     ])
 
-    # ── ADD ENTRY ──────────────────────────────────────────────────────────────
+    # ── UPLOAD & RECONCILE ─────────────────────────────────────────────────────
     with di_subtab1:
-        st.markdown("**Link to a guest booking and record the extra/direct income received.**")
+        st.markdown("**Step 1 — Select the month, then upload the Airbnb CSV for that month.**")
 
         ym_list_di = get_year_month_list()
         ym_labels_di = [f"{MONTHS[m-1]} {y} ({operation_year(y,m)})" for y,m in ym_list_di]
         sel_idx_di = st.selectbox(
-            "Month", range(len(ym_labels_di)),
-            format_func=lambda i: ym_labels_di[i], key="di_month"
+            "Month to reconcile",
+            range(len(ym_labels_di)),
+            format_func=lambda i: ym_labels_di[i],
+            key="di_month"
         )
         di_year, di_month = ym_list_di[sel_idx_di]
 
-        col_di1, col_di2 = st.columns(2, gap="large")
-        with col_di1:
-            di_guest    = st.text_input("Guest Name", placeholder="e.g. Xin Lu", key="di_guest")
-            di_type     = st.selectbox("Income Type", DIRECT_INCOME_TYPES, key="di_type")
-            di_amount   = st.number_input("Amount (RM)", min_value=0.0, step=10.0,
-                              format="%.2f", key="di_amount")
-            di_date     = st.text_input("Date Received (YYYY-MM-DD)",
-                              value=datetime.date.today().isoformat(), key="di_date")
-        with col_di2:
-            di_method   = st.selectbox("Payment Method",
-                ["Cash","Bank Transfer","DuitNow","Other"], key="di_method")
-            di_ref      = st.text_input("Reference / Remarks",
-                              placeholder="e.g. Cash 1200, Extra mattress fee", key="di_ref")
-            di_airbnb_booking = st.text_input("Linked Airbnb Booking (optional)",
-                              placeholder="e.g. Guest's Airbnb reservation ref", key="di_airbnb")
-            di_notes    = st.text_area("Notes", height=80, key="di_notes",
-                              placeholder="e.g. Direct booking, not via Airbnb. Paid cash on arrival.")
+        csv_upload = st.file_uploader(
+            "Upload Airbnb CSV for this month",
+            type=["csv"], key="di_csv_upload"
+        )
 
-        if st.button("💾 Save Direct Income Entry", type="primary", key="btn_save_di"):
-            if not di_guest.strip() or di_amount <= 0:
-                st.error("Guest name and amount are required.")
-            else:
-                conn = get_db()
-                db_error = None
+        if csv_upload:
+            csv_bytes = csv_upload.read()
+            st.session_state["di_csv_bytes"] = csv_bytes
+            st.session_state["di_csv_name"]  = csv_upload.name
+            st.success(f"✓ File ready: {csv_upload.name}")
+
+        if st.session_state.get("di_csv_bytes") and st.button(
+            "🔍 Reconcile — Compare Airbnb vs Manager Report",
+            type="primary", key="btn_reconcile_di"
+        ):
+            with st.spinner("Comparing Airbnb CSV against Manager report in database..."):
                 try:
-                    conn.execute(
-                        """INSERT INTO direct_income
-                           (year,month,guest_name,income_type,amount,date_received,
-                            payment_method,reference,airbnb_booking_ref,notes)
-                           VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                        (di_year, di_month, di_guest.strip(), di_type, di_amount,
-                         di_date, di_method, di_ref, di_airbnb_booking, di_notes)
-                    )
-                    conn.commit()
+                    # Parse Airbnb CSV
+                    airbnb_rows = parse_airbnb_csv(st.session_state["di_csv_bytes"])
+
+                    # Get DB bookings for this month
+                    conn = get_db()
+                    db_bk = conn.execute(
+                        "SELECT * FROM bookings WHERE year=? AND month=? ORDER BY checkin",
+                        (di_year, di_month)
+                    ).fetchall()
+                    conn.close()
+                    db_bookings = [dict(b) for b in db_bk]
+
+                    if not db_bookings:
+                        st.warning(f"No Manager report found in database for {MONTHS[di_month-1]} {di_year}. "
+                                   f"Please scan the Manager's Monthly Report in Tab 2 first.")
+                    else:
+                        result = reconcile_airbnb_vs_manager(airbnb_rows, db_bookings)
+                        st.session_state["di_reconcile_result"] = result
+                        st.session_state["di_reconcile_year"]   = di_year
+                        st.session_state["di_reconcile_month"]  = di_month
+                        st.success(f"✓ Reconciliation complete — {len(result['directs'])} Direct/Extra entries identified.")
                 except Exception as e:
-                    db_error = str(e)
-                finally:
+                    st.error(f"Reconciliation failed: {e}")
+
+        # Show reconciliation results
+        if "di_reconcile_result" in st.session_state:
+            res   = st.session_state["di_reconcile_result"]
+            r_yr  = st.session_state["di_reconcile_year"]
+            r_mo  = st.session_state["di_reconcile_month"]
+
+            st.markdown(f"### Reconciliation — {MONTHS[r_mo-1]} {r_yr}")
+
+            # Summary metrics
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Manager Report Total", fmt_myr(res["db_total"]))
+            m2.metric("Airbnb Payout Total",  fmt_myr(res["airbnb_total"]))
+            m3.metric("Direct/Extras",         fmt_myr(res["direct_total"]))
+            m4.metric("Difference",            fmt_myr(res["difference"]))
+
+            # Airbnb matched bookings
+            st.markdown("---")
+            st.markdown("**✅ Airbnb Bookings — Matched:**")
+            if res["matched"]:
+                matched_df = pd.DataFrame([{
+                    "Guest":          m["guest"],
+                    "Check-in":       m["checkin"],
+                    "Check-out":      m["checkout"],
+                    "Nights":         m["nights"],
+                    "Airbnb Payout":  fmt_myr(m["airbnb_payout"]),
+                    "Airbnb Gross":   fmt_myr(m["airbnb_gross"]),
+                    "DB Amount":      fmt_myr(m["db_amount"]),
+                    "Diff":           fmt_myr(m["amount_diff"]) if abs(m["amount_diff"]) > 0.10 else "✅",
+                    "Confirmation":   m["confirmation"],
+                } for m in res["matched"]])
+                st.dataframe(matched_df, use_container_width=True, hide_index=True)
+            else:
+                st.info("No matched bookings found.")
+
+            # Direct / Extras
+            st.markdown("---")
+            st.markdown("**⚡ Direct Bookings & Extras — Not in Airbnb CSV:**")
+            if res["directs"]:
+                st.warning(f"{len(res['directs'])} booking(s) found in Manager report but NOT in Airbnb — "
+                           f"these are Direct bookings or Extra charges.")
+
+                # Let user classify each one
+                direct_entries = []
+                for i, d in enumerate(res["directs"]):
+                    with st.expander(
+                        f"**{d['guest']}** — {fmt_myr(d['amount'])} — {d['checkin']} to {d['checkout']}",
+                        expanded=True
+                    ):
+                        dc1, dc2 = st.columns(2)
+                        d_type = dc1.selectbox(
+                            "Income Type",
+                            DIRECT_INCOME_TYPES,
+                            key=f"di_type_{i}"
+                        )
+                        d_method = dc2.selectbox(
+                            "Payment Method",
+                            ["Cash","Bank Transfer","DuitNow","Other"],
+                            key=f"di_method_{i}"
+                        )
+                        d_ref = st.text_input(
+                            "Reference / Remarks",
+                            key=f"di_ref_{i}",
+                            placeholder="e.g. Cash on arrival, Bank transfer ref"
+                        )
+                        d_notes = st.text_input(
+                            "Notes (optional)",
+                            key=f"di_notes_{i}"
+                        )
+                        direct_entries.append({
+                            "guest":          d["guest"],
+                            "amount":         d["amount"],
+                            "checkin":        d["checkin"],
+                            "checkout":       d["checkout"],
+                            "nights":         d["nights"],
+                            "income_type":    d_type,
+                            "payment_method": d_method,
+                            "reference":      d_ref,
+                            "notes":          d_notes,
+                            "db_id":          d["db_id"],
+                        })
+
+                st.markdown("---")
+                if st.button("💾 Save All Direct/Extra Entries", type="primary", key="btn_save_direct"):
+                    conn = get_db()
+                    saved = 0
+                    errors = []
+                    for entry in direct_entries:
+                        try:
+                            conn.execute(
+                                """INSERT INTO direct_income
+                                   (year,month,guest_name,income_type,amount,date_received,
+                                    payment_method,reference,airbnb_booking_ref,notes)
+                                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                                (r_yr, r_mo, entry["guest"], entry["income_type"],
+                                 entry["amount"], entry["checkin"],
+                                 entry["payment_method"], entry["reference"],
+                                 "", entry["notes"])
+                            )
+                            conn.commit()
+                            saved += 1
+                        except Exception as e:
+                            errors.append(f"{entry['guest']}: {e}")
                     conn.close()
 
-                if db_error:
-                    st.error(f"❌ Save failed: {db_error}")
-                else:
-                    st.success(f"✓ Entry saved — {di_guest} / {di_type} / {fmt_myr(di_amount)}")
+                    if errors:
+                        for err in errors:
+                            st.error(f"❌ {err}")
+                    else:
+                        st.success(f"✓ {saved} Direct/Extra entries saved for {MONTHS[r_mo-1]} {r_yr}.")
+                        # Clear reconciliation state
+                        for k in ["di_reconcile_result","di_reconcile_year",
+                                  "di_reconcile_month","di_csv_bytes","di_csv_name"]:
+                            st.session_state.pop(k, None)
+                        st.rerun()
+
+                if st.button("🗑️ Discard & Start Over", key="btn_discard_di"):
+                    for k in ["di_reconcile_result","di_reconcile_year",
+                              "di_reconcile_month","di_csv_bytes","di_csv_name"]:
+                        st.session_state.pop(k, None)
+                    st.rerun()
+            else:
+                st.success("✅ All bookings matched — no Direct/Extra entries this month.")
+                if st.button("✅ Done", key="btn_di_done"):
+                    for k in ["di_reconcile_result","di_reconcile_year",
+                              "di_reconcile_month","di_csv_bytes","di_csv_name"]:
+                        st.session_state.pop(k, None)
                     st.rerun()
 
     # ── ALL RECORDS ─────────────────────────────────────────────────────────────
     with di_subtab2:
         rf1, rf2, rf3 = st.columns(3)
-        di_filter_yr  = rf1.selectbox("Year",  list(range(datetime.datetime.now().year, 2023, -1)), key="di_fyr")
-        di_filter_mo  = rf2.selectbox("Month", ["All"] + MONTHS, key="di_fmo")
-        di_filter_type= rf3.selectbox("Type",  ["All"] + DIRECT_INCOME_TYPES, key="di_ftype")
+        di_filter_yr   = rf1.selectbox("Year",  list(range(datetime.datetime.now().year,2023,-1)), key="di_fyr")
+        di_filter_mo   = rf2.selectbox("Month", ["All"] + MONTHS, key="di_fmo")
+        di_filter_type = rf3.selectbox("Type",  ["All"] + DIRECT_INCOME_TYPES, key="di_ftype")
 
         conn = get_db()
         if di_filter_mo == "All":
@@ -3204,7 +3421,9 @@ with tab10:
             st.info("No direct income entries for this period.")
         else:
             total_di = sum(float(r.get("amount",0) or 0) for r in di_rows)
-            st.metric("Total Direct Income", fmt_myr(total_di))
+            m1, m2 = st.columns(2)
+            m1.metric("Total Entries", len(di_rows))
+            m2.metric("Total Amount", fmt_myr(total_di))
             st.divider()
 
             for r in [dict(r) for r in di_rows]:
@@ -3215,31 +3434,28 @@ with tab10:
                     f"{r.get('income_type','—')} — {fmt_myr(r.get('amount',0))}",
                     expanded=False
                 ):
-                    d1,d2,d3 = st.columns(3)
+                    d1, d2, d3 = st.columns(3)
                     d1.markdown(f"**Date:** {r.get('date_received','—')}")
                     d2.markdown(f"**Method:** {r.get('payment_method','—')}")
                     d3.markdown(f"**Ref:** {r.get('reference','—')}")
-                    if r.get("airbnb_booking_ref"):
-                        st.markdown(f"**Airbnb Ref:** {r.get('airbnb_booking_ref','')}")
                     if r.get("notes"):
                         st.markdown(f"**Notes:** {r.get('notes','')}")
 
                     st.divider()
-                    del1, del2 = st.columns([4,1])
-                    if del2.button("🗑️ Delete", key=f"di_del_{r_id}"):
+                    _, del_col = st.columns([4, 1])
+                    if del_col.button("🗑️ Delete", key=f"di_del_{r_id}"):
                         st.session_state[f"di_confirm_del_{r_id}"] = True
 
                     if st.session_state.get(f"di_confirm_del_{r_id}"):
                         st.error("Delete this record permanently?")
                         cc1, cc2 = st.columns(2)
-                        if cc1.button("✅ Yes, delete", key=f"di_del_confirm_{r_id}", type="primary"):
+                        if cc1.button("✅ Yes", key=f"di_del_yes_{r_id}", type="primary"):
                             conn = get_db()
                             conn.execute("DELETE FROM direct_income WHERE id=?", (r_id,))
                             conn.commit(); conn.close()
                             st.session_state.pop(f"di_confirm_del_{r_id}", None)
-                            st.success("Deleted.")
                             st.rerun()
-                        if cc2.button("❌ Cancel", key=f"di_del_cancel_{r_id}"):
+                        if cc2.button("❌ Cancel", key=f"di_del_no_{r_id}"):
                             st.session_state.pop(f"di_confirm_del_{r_id}", None)
                             st.rerun()
 
@@ -3255,23 +3471,22 @@ with tab10:
         conn.close()
 
         if not all_di:
-            st.info("No direct income entries yet. Add entries via the '➕ Add Entry' tab.")
+            st.info("No direct income entries yet. Upload an Airbnb CSV in the '📥 Upload & Reconcile' tab.")
         else:
-            # All-time totals
-            total_direct   = sum(float(r.get("amount",0) or 0) for r in all_di)
-            total_airbnb_bk= sum(float(r.get("total",0) or 0) for r in all_bk)
-            # Airbnb-only = total bookings minus direct bookings already in bookings table
-            # Direct income register is SUPPLEMENTARY — separate from bookings table
-            # So total income = bookings total + direct income total
+            total_direct    = sum(float(r.get("amount",0) or 0) for r in all_di)
+            total_airbnb_bk = sum(float(r.get("total",0) or 0) for r in all_bk)
 
-            at1, at2, at3 = st.columns(3)
-            at1.metric("Total Airbnb Income (DB)", fmt_myr(total_airbnb_bk))
-            at2.metric("Total Direct/Extras (register)", fmt_myr(total_direct))
+            at1, at2, at3, at4 = st.columns(4)
+            at1.metric("Airbnb Income (DB)", fmt_myr(total_airbnb_bk))
+            at2.metric("Direct/Extras", fmt_myr(total_direct))
             at3.metric("Combined Total", fmt_myr(total_airbnb_bk + total_direct))
+            at4.metric("Direct %",
+                f"{total_direct/(total_airbnb_bk+total_direct)*100:.1f}%"
+                if (total_airbnb_bk + total_direct) > 0 else "—")
 
             st.divider()
 
-            # By type breakdown
+            # By type
             st.markdown("**Breakdown by Income Type:**")
             type_totals = {}
             for r in all_di:
@@ -3287,7 +3502,7 @@ with tab10:
             st.divider()
 
             # Monthly trend
-            st.markdown("**Monthly Direct Income:**")
+            st.markdown("**Monthly Summary — Airbnb vs Direct/Extras:**")
             monthly_di = {}
             for r in all_di:
                 key = (int(r.get("year",0)), int(r.get("month",0)))
@@ -3295,24 +3510,23 @@ with tab10:
 
             trend_rows = []
             for (yr, mo), amt in sorted(monthly_di.items()):
-                # Get Airbnb total for same month
                 ab_mo = next((float(r.get("total",0)) for r in all_bk
                               if int(r.get("year",0))==yr and int(r.get("month",0))==mo), 0)
                 combined = ab_mo + amt
                 pct = amt/combined*100 if combined > 0 else 0
                 trend_rows.append({
-                    "Month": f"{MONTHS[mo-1]} {yr}",
-                    "Airbnb (RM)": fmt_myr(ab_mo),
+                    "Month":              f"{MONTHS[mo-1]} {yr}",
+                    "Airbnb (RM)":        fmt_myr(ab_mo),
                     "Direct/Extras (RM)": fmt_myr(amt),
-                    "Combined (RM)": fmt_myr(combined),
-                    "Direct %": f"{pct:.1f}%"
+                    "Combined (RM)":      fmt_myr(combined),
+                    "Direct %":           f"{pct:.1f}%",
                 })
             if trend_rows:
                 st.dataframe(pd.DataFrame(trend_rows), use_container_width=True, hide_index=True)
 
             st.info(
                 "💡 **Note for ULU 2 feasibility:** Use Airbnb Income only as the benchmark. "
-                "Direct/Extras are non-recurring and should not be used to project future income."
+                "Direct/Extras are non-recurring and should not be projected as future income."
             )
 
     st.markdown('</div>', unsafe_allow_html=True)
