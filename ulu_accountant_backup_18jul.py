@@ -37,218 +37,6 @@ def get_supabase() -> Client:
     return create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ─────────────────────────────────────────────
-# PAYMENT ATTACHMENTS — CLAIM INVOICE + PROOF OF PAYMENT
-# Uploaded to Supabase Storage (survives Streamlit Cloud restarts) AND saved
-# locally to a "Payment Voucher Attachments" folder for direct accountant/
-# auditor access via OneDrive — same folder name/convention already used.
-# Create the bucket once in Supabase: Storage → New bucket → "ulu1-attachments" (private).
-# ─────────────────────────────────────────────
-PAYMENT_BUCKET = "ulu1-attachments"
-ACCOUNTING_FOLDER_ROOT = "Accounting Folder - Payment Vouchers"
-PV_ATTACHMENTS_FOLDER = os.path.join(ACCOUNTING_FOLDER_ROOT, "Payment Voucher Attachments")
-PV_VOUCHERS_FOLDER = os.path.join(ACCOUNTING_FOLDER_ROOT, "Vouchers")
-
-def parse_attachment_paths(value):
-    """Attachment path columns may hold a single legacy path (old records)
-    or a JSON list of paths (multi-file records going forward). Normalise
-    to a list either way."""
-    if not value:
-        return []
-    try:
-        parsed = json.loads(value)
-        if isinstance(parsed, list):
-            return parsed
-        return [str(parsed)]
-    except Exception:
-        return [value]  # legacy plain string path
-
-def is_running_on_cloud():
-    return bool(os.environ.get("STREAMLIT_SHARING_MODE")) or \
-           os.environ.get("HOME","").startswith("/home/appuser") or \
-           "/mount/src" in os.path.abspath(__file__)
-
-def upload_payment_file(file_bytes, file_name, kind):
-    """Upload a claim invoice / proof-of-payment file to Supabase Storage.
-    Returns the storage path (to store in the DB) or None on failure."""
-    if not file_bytes:
-        return None
-    sb = get_supabase()
-    ext = Path(file_name).suffix.lower() or ".bin"
-    safe_name = f"{datetime.datetime.now().strftime('%Y%m%d%H%M%S%f')}{ext}"
-    storage_path = f"{kind}/{safe_name}"
-    try:
-        sb.storage.from_(PAYMENT_BUCKET).upload(
-            storage_path, file_bytes,
-            file_options={"content-type": "application/octet-stream"}
-        )
-        return storage_path
-    except Exception as e:
-        st.error(f"Attachment upload failed: {e}")
-        return None
-
-def get_payment_file_url(storage_path, expires_in=1209600):
-    """Return a temporary signed URL to view/download a stored attachment (14-day expiry)."""
-    if not storage_path:
-        return None
-    sb = get_supabase()
-    try:
-        res = sb.storage.from_(PAYMENT_BUCKET).create_signed_url(storage_path, expires_in)
-        return res.get("signedURL") or res.get("signed_url") or res.get("signedUrl")
-    except Exception as e:
-        st.warning(f"Couldn't generate a link for '{storage_path}': {e}")
-        return None
-
-def save_payment_attachment_local(file_bytes, file_name, subfolder, voucher_no, index=0):
-    """Save a copy into the local Payment Voucher Attachments folder for direct
-    auditor/accountant access via OneDrive sync. Only persists when running
-    locally — Streamlit Cloud's disk resets on redeploy, so Supabase Storage
-    (above) is the source of truth and this is a convenience copy."""
-    if not file_bytes or is_running_on_cloud():
-        return None
-    folder = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                           PV_ATTACHMENTS_FOLDER, subfolder)
-    os.makedirs(folder, exist_ok=True)
-    ext = Path(file_name).suffix or ".bin"
-    suffix = f"_{index+1}" if index > 0 else ""
-    fn = f"{voucher_no}_{subfolder.replace(' ','_')}{suffix}{ext}"
-    local_path = os.path.join(folder, fn)
-    with open(local_path, "wb") as _f:
-        _f.write(file_bytes)
-    return local_path
-
-@st.cache_data(ttl=300, show_spinner=False)
-def cached_read_local_file(path, mtime_hint=None):
-    """Read a local file's bytes, cached. mtime_hint busts the cache if the
-    file is replaced. Returns None if the path doesn't exist — this check
-    itself is cached too, which matters a lot on OneDrive-synced folders
-    where Files On-Demand can make os.path.exists a network round trip.
-    Previously this ran uncached, once per row, on EVERY app rerun
-    regardless of which tab was open — the likely main cause of multi-
-    minute lag as the CapEx/scan lists grew."""
-    if not path or not os.path.exists(path):
-        return None
-    with open(path, "rb") as _f:
-        return _f.read()
-
-def save_voucher_pdf_local(pdf_bytes, voucher_no):
-    """Save the generated voucher PDF itself into the Vouchers subfolder.
-    Only persists when running locally, same as save_payment_attachment_local."""
-    if not pdf_bytes or is_running_on_cloud():
-        return None
-    folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), PV_VOUCHERS_FOLDER)
-    os.makedirs(folder, exist_ok=True)
-    local_path = os.path.join(folder, f"{voucher_no}.pdf")
-    with open(local_path, "wb") as _f:
-        _f.write(pdf_bytes)
-    return local_path
-
-# ─────────────────────────────────────────────
-# AIRBNB CSV RECONCILE + DIRECT INCOME & EXTRAS
-# Moved here from near Tab 10 — must be defined before the Airbnb CSV & Reconcile
-# sub-tab under Scan Receipts runs, since Streamlit executes top-to-bottom on every
-# rerun. This was a pre-existing ordering bug causing 'parse_airbnb_csv is not defined'.
-# ─────────────────────────────────────────────
-DIRECT_INCOME_TYPES = [
-    "Direct Booking (Cash/Transfer)",
-    "Extra Mattress",
-    "Baby Cot",
-    "Extra Cleaning",
-    "Damage Compensation",
-    "Cancellation Fee",
-    "Other Extra Charge",
-]
-
-def parse_airbnb_csv(file_bytes: bytes) -> list:
-    """Parse Airbnb CSV export and return list of reservation dicts."""
-    import csv, io
-    text = file_bytes.decode("utf-8-sig")
-    reader = csv.DictReader(io.StringIO(text))
-    reservations = []
-    for row in reader:
-        if row.get("Type","").strip() == "Reservation":
-            try:
-                reservations.append({
-                    "confirmation": row.get("Confirmation code","").strip(),
-                    "guest":        row.get("Guest","").strip(),
-                    "checkin":      row.get("Start date","").strip(),
-                    "checkout":     row.get("End date","").strip(),
-                    "nights":       int(float(row.get("Nights",0) or 0)),
-                    "payout":       float(row.get("Amount",0) or 0),
-                    "gross":        float(row.get("Gross earnings",0) or 0),
-                    "service_fee":  float(row.get("Service fee",0) or 0),
-                    "currency":     row.get("Currency","MYR").strip(),
-                })
-            except Exception:
-                pass
-    return reservations
-
-def reconcile_airbnb_vs_manager(airbnb_rows: list, db_bookings: list) -> dict:
-    """
-    Compare Airbnb CSV bookings vs manager DB bookings for same month.
-    Returns dict with matched, direct/extras, and summary.
-    """
-    # Build lookup of DB bookings by guest name (normalised)
-    def norm(s): return (s or "").upper().strip().split()[0]  # first word match
-
-    db_lookup = {}
-    for b in db_bookings:
-        key = norm(b.get("guest_name",""))
-        if key not in db_lookup:
-            db_lookup[key] = []
-        db_lookup[key].append(b)
-
-    airbnb_names = {norm(r["guest"]) for r in airbnb_rows}
-    db_names     = set(db_lookup.keys())
-
-    matched  = []
-    directs  = []
-
-    # Airbnb guests matched in DB
-    for r in airbnb_rows:
-        key = norm(r["guest"])
-        if key in db_names:
-            db_match = db_lookup[key][0]
-            matched.append({
-                "guest":        r["guest"],
-                "checkin":      r["checkin"],
-                "checkout":     r["checkout"],
-                "nights":       r["nights"],
-                "airbnb_payout":r["payout"],
-                "airbnb_gross": r["gross"],
-                "db_amount":    float(db_match.get("amount",0) or 0),
-                "confirmation": r["confirmation"],
-                "amount_diff":  float(db_match.get("amount",0) or 0) - r["payout"],
-            })
-        # else: in Airbnb but not in DB — cross-month (checkout next month)
-
-    # DB bookings NOT in Airbnb CSV = Direct/Extras
-    for b in db_bookings:
-        key = norm(b.get("guest_name",""))
-        if key not in airbnb_names:
-            directs.append({
-                "guest":    b.get("guest_name",""),
-                "checkin":  b.get("checkin",""),
-                "checkout": b.get("checkout",""),
-                "nights":   int(b.get("nights",0) or 0),
-                "amount":   float(b.get("amount",0) or 0),
-                "source":   b.get("source",""),
-                "db_id":    b.get("id"),
-            })
-
-    airbnb_total = sum(r["payout"] for r in airbnb_rows)
-    db_total     = sum(float(b.get("amount",0) or 0) for b in db_bookings)
-    direct_total = sum(d["amount"] for d in directs)
-
-    return {
-        "matched":       matched,
-        "directs":       directs,
-        "airbnb_total":  airbnb_total,
-        "db_total":      db_total,
-        "direct_total":  direct_total,
-        "difference":    db_total - airbnb_total,
-    }
-
-# ─────────────────────────────────────────────
 # SUPABASE DB ADAPTER
 # Mimics sqlite3 connection interface so rest of app stays unchanged
 # ─────────────────────────────────────────────
@@ -721,7 +509,6 @@ CAPEX_CATEGORIES = [
 # OpEx vs CapEx classification rule (for reference)
 CAPEX_THRESHOLD = 1000  # Items above RM1,000 with multi-year life = CapEx
 
-@st.cache_data(ttl=300)
 def get_setting(key):
     conn = get_db()
     r = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
@@ -733,9 +520,7 @@ def set_setting(key, value):
     conn.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, str(value)))
     conn.commit()
     conn.close()
-    get_setting.clear()  # invalidate cache — this setting just changed
 
-@st.cache_data(ttl=300)
 def get_year_month_list():
     """Return list of (year, month) tuples from operation start to now."""
     start_y = int(get_setting("operation_start_year") or 2024)
@@ -762,7 +547,6 @@ def operation_year(year, month):
 def fmt_myr(v):
     return f"RM {float(v or 0):,.2f}"
 
-@st.cache_data(ttl=30)
 def get_monthly_summary(year, month):
     conn = get_db()
     gross_income = conn.execute(
@@ -799,7 +583,6 @@ def get_monthly_summary(year, month):
         "owner_share": owner_share,
     }
 
-@st.cache_data(ttl=30)
 def get_yearly_summary(year):
     # Get all months that have bookings or expenses — avoid GROUP BY which breaks Supabase adapter
     conn = get_db()
@@ -1236,7 +1019,7 @@ with st.sidebar:
 # ─────────────────────────────────────────────
 # TABS
 # ─────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
     "📅  Monthly Entry",
     "🧾  Scan Receipts",
     "📊  Monthly P&L",
@@ -1247,7 +1030,6 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs([
     "📦  Accountant",
     "💳  Payments & Vouchers",
     "💰  Direct Income & Extras",
-    "📉  Trends & Analytics",
 ])
 
 # ══════════════════════════════════════════════
@@ -1577,15 +1359,15 @@ with tab2:
 
                     dl_col, del_col = st.columns([3, 1])
                     sp = s["scan_path"]
-                    _scan_bytes = cached_read_local_file(sp) if sp else None
-                    if _scan_bytes:
-                        ext_sp = sp.split(".")[-1].lower()
-                        mime_sp = "application/pdf" if ext_sp == "pdf" else f"image/{ext_sp}"
-                        dl_col.download_button(
-                            f"⬇️ Download Original Report",
-                            data=_scan_bytes, file_name=os.path.basename(sp), mime=mime_sp,
-                            key=f"mgr_dl_{s['id']}"
-                        )
+                    if sp and os.path.exists(sp):
+                        with open(sp, "rb") as _f:
+                            ext_sp = sp.split(".")[-1].lower()
+                            mime_sp = "application/pdf" if ext_sp == "pdf" else f"image/{ext_sp}"
+                            dl_col.download_button(
+                                f"⬇️ Download Original Report",
+                                data=_f.read(), file_name=os.path.basename(sp), mime=mime_sp,
+                                key=f"mgr_dl_{s['id']}"
+                            )
                     else:
                         dl_col.caption("Original file not found on disk.")
 
@@ -1988,32 +1770,21 @@ with tab4:
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.markdown('<p class="card-title">📊 All-Time Performance Summary</p>', unsafe_allow_html=True)
 
-    # Compute all-time figures across all years — cached since this is 7 round trips
-    # and previously ran fresh on every single rerun regardless of which tab was open.
-    @st.cache_data(ttl=60)
-    def _get_alltime_booking_figures():
-        conn = get_db()
-        vals = {
-            "gross":    conn.execute("SELECT COALESCE(SUM(amount),0) as t FROM bookings").fetchone()["t"],
-            "mgr":      conn.execute("SELECT COALESCE(SUM(amount),0) as t FROM manager_expenses").fetchone()["t"],
-            "personal": conn.execute("SELECT COALESCE(SUM(ulu_share),0) as t FROM personal_expenses").fetchone()["t"],
-            "nights":   conn.execute("SELECT COALESCE(SUM(nights),0) as t FROM bookings").fetchone()["t"],
-            "bookings": conn.execute("SELECT COUNT(*) as t FROM bookings").fetchone()["t"],
-            "whole":    conn.execute("SELECT COUNT(*) as t FROM bookings WHERE room_type='WHOLE'").fetchone()["t"],
-            "mbed":     conn.execute("SELECT COUNT(*) as t FROM bookings WHERE room_type='MBED'").fetchone()["t"],
-        }
-        conn.close()
-        return vals
-
-    _at = _get_alltime_booking_figures()
-    at_gross, at_mgr, at_personal = _at["gross"], _at["mgr"], _at["personal"]
-    at_nights, at_bookings = _at["nights"], _at["bookings"]
-    at_whole, at_mbed = _at["whole"], _at["mbed"]
+    # Compute all-time figures across all years
+    conn = get_db()
+    at_gross   = conn.execute("SELECT COALESCE(SUM(amount),0) as t FROM bookings").fetchone()["t"]
+    at_mgr     = conn.execute("SELECT COALESCE(SUM(amount),0) as t FROM manager_expenses").fetchone()["t"]
+    at_personal= conn.execute("SELECT COALESCE(SUM(ulu_share),0) as t FROM personal_expenses").fetchone()["t"]
+    at_nights  = conn.execute("SELECT COALESCE(SUM(nights),0) as t FROM bookings").fetchone()["t"]
+    at_bookings= conn.execute("SELECT COUNT(*) as t FROM bookings").fetchone()["t"]
+    at_whole   = conn.execute("SELECT COUNT(*) as t FROM bookings WHERE room_type='WHOLE'").fetchone()["t"]
+    at_mbed    = conn.execute("SELECT COUNT(*) as t FROM bookings WHERE room_type='MBED'").fetchone()["t"]
     # Months in operation
     start_y = int(get_setting("operation_start_year") or 2024)
     start_m = int(get_setting("operation_start_month") or 7)
     now = datetime.datetime.now()
     months_ops = (now.year - start_y) * 12 + (now.month - start_m) + 1
+    conn.close()
 
     at_opex        = at_mgr + at_personal
     at_net_before  = at_gross - at_opex
@@ -2438,13 +2209,13 @@ Return ONLY the JSON."""
                 rc4.markdown(f"<span style='color:#1C1C1A;font-size:0.9rem;font-weight:600'>{fmt_myr(r.get('amount',0))}</span>", unsafe_allow_html=True)
                 # Receipt file — use file_name or receipt_path
                 sp = r.get("receipt_path","") or r.get("scan_path","") or r.get("file_name","")
-                _file_bytes = cached_read_local_file(sp) if sp else None
-                if _file_bytes:
-                    ext = sp.split(".")[-1].lower()
-                    mime = "application/pdf" if ext=="pdf" else f"image/{ext}"
-                    rc5.download_button("📎", data=_file_bytes,
-                        file_name=os.path.basename(sp), mime=mime,
-                        key=f"cx_dl_{r['id']}")
+                if sp and os.path.exists(sp):
+                    with open(sp,"rb") as _f:
+                        ext = sp.split(".")[-1].lower()
+                        mime = "application/pdf" if ext=="pdf" else f"image/{ext}"
+                        rc5.download_button("📎", data=_f.read(),
+                            file_name=os.path.basename(sp), mime=mime,
+                            key=f"cx_dl_{r['id']}")
                 elif sp:
                     rc5.caption("📎")  # file recorded but not on this machine
                 else:
@@ -3062,18 +2833,11 @@ with tab8:
                 "📋 Manager Monthly Reports": "Manager Monthly Reports",
                 "📋 CapEx Receipts": "CapEx Receipts",
                 "📊 Accountant Reports": "ULU Accountant Reports",
-                "💳 Payment Vouchers & Attachments": ACCOUNTING_FOLDER_ROOT,
             }
-            @st.cache_data(ttl=60, show_spinner=False)
-            def _count_folder_files(fpath):
-                if not os.path.exists(fpath):
-                    return None
-                return sum(len(files) for _, _, files in os.walk(fpath))
-
             for label, folder in folders.items():
                 fpath = os.path.join(base_dir, folder)
-                file_count = _count_folder_files(fpath)
-                if file_count is not None:
+                if os.path.exists(fpath):
+                    file_count = sum(len(files) for _, _, files in os.walk(fpath))
                     st.write(f"{label} — {file_count} file(s)")
                 else:
                     st.write(f"{label} — folder not yet created")
@@ -3090,15 +2854,12 @@ with tab8:
                 placeholder="Right-click folder → Share → Copy link")
             od_reports = st.text_input("📊 ULU Accountant Reports folder link", key="od_ulu_rpt",
                 placeholder="Right-click folder → Share → Copy link")
-            od_vouchers = st.text_input("💳 Payment Vouchers & Attachments folder link", key="od_ulu_vouchers",
-                placeholder="Right-click folder → Share → Copy link")
 
             if st.button("📱 Generate WhatsApp Message", key="gen_ulu_wa"):
                 links = ""
-                if od_reports:  links += f"📊 *Financial Reports (Excel):*\n{od_reports}\n\n"
-                if od_mgr:      links += f"📋 *Manager Monthly Reports (Azary's Submissions):*\n{od_mgr}\n\n"
-                if od_capex:    links += f"📋 *CapEx Receipts & Invoices:*\n{od_capex}\n\n"
-                if od_vouchers: links += f"💳 *Payment Vouchers & Attachments (Claim Invoices + Proof of Payment):*\n{od_vouchers}\n\n"
+                if od_reports: links += f"📊 *Financial Reports (Excel):*\n{od_reports}\n\n"
+                if od_mgr:     links += f"📋 *Manager Monthly Reports (Azary's Submissions):*\n{od_mgr}\n\n"
+                if od_capex:   links += f"📋 *CapEx Receipts & Invoices:*\n{od_capex}\n\n"
                 if not links:
                     st.warning("Please paste at least one link.")
                 else:
@@ -3123,7 +2884,6 @@ with tab8:
 - ✅ Manager Monthly Reports (Azary's original billing submissions)
 - ✅ Airbnb statements for the year
 - ✅ CapEx Schedule (for depreciation claims)
-- ✅ Payment Vouchers + Claim Invoices + Proof of Payment (all vendor/management fee payments)
 
 **For RPGT (if property sold):**
 - ✅ CapEx receipts (all upgrade costs increase your cost base)
@@ -3138,7 +2898,6 @@ with tab8:
 1. Generate Excel report from this tab
 2. Share CapEx Receipts folder (all original invoices)
 3. Share ULU Accountant Reports folder
-4. Share Payment Vouchers & Attachments folder (Accounting Folder - Payment Vouchers)
 """)
     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -3224,6 +2983,12 @@ PAYMENT_TYPES    = [
     "Other",
 ]
 STATUS_ICONS = {"Pending":"🟡","Paid":"🟢","Partial":"🔵","Cancelled":"⚫"}
+
+def generate_voucher_number(year, month):
+    conn = get_db()
+    rows = conn.execute("SELECT id FROM payments WHERE year=? AND month=? ORDER BY id",(year,month)).fetchall()
+    conn.close()
+    return f"PV-{year}-{month:02d}-{len(rows)+1:03d}"
 
 def generate_payment_voucher_pdf(payment: dict) -> bytes:
     buf = io.BytesIO()
@@ -3321,44 +3086,9 @@ with tab9:
             format_func=lambda i: ym_labels_pv[i], key="pv_month")
         pv_year, pv_month = ym_list_pv[sel_idx_pv]
 
-        # ── Payee autofill from history ──────────────────────────────────────
-        @st.cache_data(ttl=30)
-        def _get_all_payments_for_payee_lookup():
-            conn = get_db()
-            rows = conn.execute("SELECT * FROM payments ORDER BY id", ()).fetchall()
-            conn.close()
-            return [dict(r) for r in rows]
-        _payee_rows = _get_all_payments_for_payee_lookup()
-        payee_lookup = {}
-        for _pr in [dict(r) for r in _payee_rows]:
-            _pname = (_pr.get("payee_name") or "").strip()
-            if _pname:
-                payee_lookup[_pname] = _pr  # later (higher id) rows overwrite → most recent wins
-        payee_options = ["+ New Payee"] + sorted(payee_lookup.keys(), key=str.lower)
-
-        def _apply_payee_autofill():
-            sel = st.session_state.get("pv_payee_select")
-            if sel and sel != "+ New Payee":
-                rec = payee_lookup.get(sel, {})
-                st.session_state["pv_payee"] = rec.get("payee_name","") or ""
-                st.session_state["pv_phone"] = rec.get("payee_phone","") or ""
-                st.session_state["pv_type"]  = rec.get("payee_type") if rec.get("payee_type") in PAYMENT_TYPES else PAYMENT_TYPES[0]
-                st.session_state["pv_bank"]  = rec.get("payee_bank","") or ""
-                st.session_state["pv_acc"]   = rec.get("payee_account","") or ""
-            elif sel == "+ New Payee":
-                for k in ["pv_payee","pv_phone","pv_bank","pv_acc"]:
-                    st.session_state[k] = ""
-                st.session_state["pv_type"] = PAYMENT_TYPES[0]
-
-        st.selectbox("Select Payee (autofills details below — edit as needed)",
-            payee_options, key="pv_payee_select", on_change=_apply_payee_autofill)
-
         col_a, col_b = st.columns(2, gap="large")
         with col_a:
             pv_payee  = st.text_input("Payee Name", placeholder="e.g. Archmedia Sdn Bhd", key="pv_payee")
-            pv_phone  = st.text_input("WhatsApp No. (optional)", key="pv_phone",
-                            placeholder="e.g. 60123456789",
-                            help="Country code + number, no + or leading 0. Used to send the voucher via WhatsApp.")
             pv_type   = st.selectbox("Payment Type", PAYMENT_TYPES, key="pv_type")
             pv_desc   = st.text_area("Description / Purpose", height=80, key="pv_desc",
                             placeholder="e.g. Property Management Fee for June 2026")
@@ -3373,104 +3103,36 @@ with tab9:
             pv_acc    = st.text_input("Payee Account No.", placeholder="e.g. 1234567890", key="pv_acc")
             pv_notes  = st.text_area("Notes", height=60, key="pv_notes")
 
-        st.markdown("**Attachments** — attach multiple files if this payment covers several invoices or receipts")
-        fcol1, fcol2 = st.columns(2)
-        pv_invoice_files = fcol1.file_uploader("📎 Attach Claim Invoice(s)", type=["jpg","jpeg","png","pdf"],
-                            key="pv_invoice_upload", accept_multiple_files=True)
-        pv_proof_files   = fcol2.file_uploader("📎 Attach Proof of Payment(s)", type=["jpg","jpeg","png","pdf"],
-                            key="pv_proof_upload", accept_multiple_files=True)
-
         if st.button("💾 Save Payment & Generate Voucher", type="primary", key="btn_save_pv"):
             if not pv_payee or pv_amount <= 0:
                 st.error("Payee name and amount are required.")
             else:
-                # Insert directly via the Supabase client so we get the new row's id
-                # back immediately — needed for PV-{id:05d} voucher numbering and to
-                # name attachment files consistently.
-                sb = get_supabase()
-                insert_res = sb.table("payments").insert({
-                    "year": pv_year, "month": pv_month,
-                    "payee_name": pv_payee, "payee_phone": pv_phone, "payee_type": pv_type,
-                    "description": pv_desc, "amount_due": pv_amount, "payment_date": pv_date,
-                    "payment_method": pv_method, "reference_no": pv_ref,
-                    "payee_bank": pv_bank, "payee_account": pv_acc,
-                    "notes": pv_notes, "status": "Pending",
-                }).execute()
-                new_id = insert_res.data[0]["id"] if insert_res.data else None
-                voucher_no = f"PV-{new_id:05d}" if new_id else f"PV-{pv_year}-{pv_month:02d}"
-
-                invoice_storage_paths = []
-                proof_storage_paths   = []
-
-                for idx, f in enumerate(pv_invoice_files or []):
-                    file_bytes = f.read()
-                    sp = upload_payment_file(file_bytes, f.name, "claim_invoice")
-                    if sp: invoice_storage_paths.append(sp)
-                    save_payment_attachment_local(file_bytes, f.name, "Claim Invoices", voucher_no, index=idx)
-
-                for idx, f in enumerate(pv_proof_files or []):
-                    file_bytes = f.read()
-                    sp = upload_payment_file(file_bytes, f.name, "proof")
-                    if sp: proof_storage_paths.append(sp)
-                    save_payment_attachment_local(file_bytes, f.name, "Proof of Payment", voucher_no, index=idx)
-
-                if new_id:
-                    sb.table("payments").update({
-                        "voucher_no": voucher_no,
-                        "claim_invoice_path": json.dumps(invoice_storage_paths) if invoice_storage_paths else None,
-                        "proof_of_payment_path": json.dumps(proof_storage_paths) if proof_storage_paths else None,
-                    }).eq("id", new_id).execute()
-
+                voucher_no = generate_voucher_number(pv_year, pv_month)
+                conn = get_db()
+                conn.execute(
+                    """INSERT INTO payments
+                       (year,month,voucher_no,payee_name,payee_type,description,amount_due,
+                        payment_date,payment_method,reference_no,payee_bank,payee_account,
+                        notes,status)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (pv_year,pv_month,voucher_no,pv_payee,pv_type,pv_desc,
+                     pv_amount,pv_date,pv_method,pv_ref,pv_bank,pv_acc,pv_notes,"Pending")
+                )
+                conn.commit(); conn.close()
                 pd_dict = {
                     "voucher_no":voucher_no,"year":pv_year,"month":pv_month,
-                    "payee_name":pv_payee,"payee_phone":pv_phone,"payee_type":pv_type,"description":pv_desc,
+                    "payee_name":pv_payee,"payee_type":pv_type,"description":pv_desc,
                     "amount_due":pv_amount,"payment_date":pv_date,"payment_method":pv_method,
                     "reference_no":pv_ref,"payee_bank":pv_bank,"payee_account":pv_acc,
                     "status":"Pending","cancellation_reason":""
                 }
                 pdf_bytes = generate_payment_voucher_pdf(pd_dict)
-                save_voucher_pdf_local(pdf_bytes, voucher_no)
                 st.success(f"Payment saved. Voucher: **{voucher_no}**")
-                if invoice_storage_paths or proof_storage_paths:
-                    n_files = len(invoice_storage_paths) + len(proof_storage_paths)
-                    st.caption(f"{n_files} attachment(s) saved to secure storage" +
-                               (" and the local Payment Voucher Attachments folder." if not is_running_on_cloud() else "."))
                 st.download_button(f"⬇️ Download {voucher_no}.pdf", data=pdf_bytes,
                     file_name=f"{voucher_no}.pdf", mime="application/pdf", key=f"dl_new_{voucher_no}")
-
-                phone_clean = (pv_phone or "").strip().lstrip("+").replace(" ","").replace("-","")
-                if phone_clean:
-                    wa_text = f"Payment Voucher {voucher_no} — {pv_payee} — {fmt_myr(pv_amount)}. Please find the voucher PDF attached."
-                    import urllib.parse as _up
-                    wa_url = f"https://wa.me/{phone_clean}?text={_up.quote(wa_text)}"
-                    st.markdown(f"[📱 Send via WhatsApp]({wa_url}) — note: WhatsApp links can't attach the PDF automatically; download it above first, then attach manually in the chat.")
                 st.rerun()
 
     with pv_subtab2:
-        with st.expander("🗂️ One-time: Backfill Legacy Voucher PDFs to Local Folder"):
-            st.caption("Regenerates a voucher PDF for every payment record on file (including old PMT-1–8 "
-                       "style entries) and saves them into the local Vouchers folder. Does not touch the "
-                       "database — safe to run any time, including repeatedly.")
-            if is_running_on_cloud():
-                st.info("This only writes files when the app is run locally (not on Streamlit Cloud), "
-                        "since cloud disk resets on redeploy. Run this from your local machine.")
-            if st.button("🔄 Regenerate All Voucher PDFs", key="btn_backfill_vouchers"):
-                conn = get_db()
-                backfill_rows = conn.execute("SELECT * FROM payments ORDER BY id", ()).fetchall()
-                conn.close()
-                count = 0
-                for br in [dict(r) for r in backfill_rows]:
-                    br_id = br.get("id")
-                    br_voucher = br.get("voucher_no") or f"PV-{br_id:05d}"
-                    br_pdf = generate_payment_voucher_pdf(br)
-                    saved_path = save_voucher_pdf_local(br_pdf, br_voucher)
-                    if saved_path:
-                        count += 1
-                if count:
-                    st.success(f"✓ Regenerated {count} voucher PDF(s) into the local Vouchers folder.")
-                else:
-                    st.warning("No files were written — this only works when running locally.")
-
         pf1, pf2, pf3 = st.columns(3)
         filter_year   = pf1.selectbox("Year",  list(range(datetime.datetime.now().year, 2023, -1)), key="pv_filter_yr")
         filter_month  = pf2.selectbox("Month", ["All"] + MONTHS, key="pv_filter_mo")
@@ -3511,7 +3173,7 @@ with tab9:
                 canc_reason = r.get("cancellation_reason","") or ""
                 payee_disp  = r.get("payee_name","") or r.get("payee","") or "—"
                 amount_disp = float(r.get("amount_due",0) or 0)
-                voucher_disp= r.get("voucher_no","") or f"PV-{r_id:05d}"
+                voucher_disp= r.get("voucher_no","") or f"PMT-{r_id}"
                 mo_d = pv_month_val(r); yr_d = pv_year_val(r)
 
                 header_label = f"{r_icon} **{voucher_disp}** — {payee_disp} — {fmt_myr(amount_disp)}"
@@ -3531,27 +3193,6 @@ with tab9:
                     d6.markdown(f"**Bank:** {r.get('payee_bank','—')} / {r.get('payee_account','—')}")
                     st.markdown(f"**Description:** {r.get('description','—')}")
                     if r.get("notes"): st.markdown(f"**Notes:** {r.get('notes','')}")
-
-                    inv_paths   = parse_attachment_paths(r.get("claim_invoice_path"))
-                    proof_paths = parse_attachment_paths(r.get("proof_of_payment_path"))
-                    if inv_paths or proof_paths:
-                        att1, att2 = st.columns(2)
-                        if inv_paths:
-                            att1.markdown(f"📎 **Claim Invoice(s)** ({len(inv_paths)}):")
-                            for i, p in enumerate(inv_paths, 1):
-                                url = get_payment_file_url(p)
-                                if url:
-                                    att1.markdown(f"&nbsp;&nbsp;[Invoice {i}]({url})")
-                        else:
-                            att1.caption("No claim invoice attached")
-                        if proof_paths:
-                            att2.markdown(f"📎 **Proof of Payment** ({len(proof_paths)}):")
-                            for i, p in enumerate(proof_paths, 1):
-                                url = get_payment_file_url(p)
-                                if url:
-                                    att2.markdown(f"&nbsp;&nbsp;[Proof {i}]({url})")
-                        else:
-                            att2.caption("No proof of payment attached")
 
                     st.divider()
                     act1,act2,act3,act4 = st.columns([2,1,2,2])
@@ -3573,13 +3214,6 @@ with tab9:
                     act3.download_button("⬇️ Voucher PDF", data=pdf_bytes,
                         file_name=f"{voucher_disp}{suffix}.pdf", mime="application/pdf",
                         key=f"dl_pv_{r_id}")
-
-                    r_phone = (r.get("payee_phone") or "").strip().lstrip("+").replace(" ","").replace("-","")
-                    if r_phone:
-                        import urllib.parse as _up
-                        wa_text_r = f"Payment Voucher {voucher_disp} — {payee_disp} — {fmt_myr(amount_disp)}. Please find the voucher PDF attached."
-                        wa_url_r = f"https://wa.me/{r_phone}?text={_up.quote(wa_text_r)}"
-                        st.markdown(f"[📱 Resend via WhatsApp]({wa_url_r})")
 
                     if not is_canc:
                         if act4.button("🚫 Cancel Record", key=f"pv_cancel_btn_{r_id}"):
@@ -3619,6 +3253,106 @@ with tab9:
 # ══════════════════════════════════════════════
 # TAB 10 — DIRECT INCOME & EXTRAS
 # ══════════════════════════════════════════════
+DIRECT_INCOME_TYPES = [
+    "Direct Booking (Cash/Transfer)",
+    "Extra Mattress",
+    "Baby Cot",
+    "Extra Cleaning",
+    "Damage Compensation",
+    "Cancellation Fee",
+    "Other Extra Charge",
+]
+
+def parse_airbnb_csv(file_bytes: bytes) -> list:
+    """Parse Airbnb CSV export and return list of reservation dicts."""
+    import csv, io
+    text = file_bytes.decode("utf-8-sig")
+    reader = csv.DictReader(io.StringIO(text))
+    reservations = []
+    for row in reader:
+        if row.get("Type","").strip() == "Reservation":
+            try:
+                reservations.append({
+                    "confirmation": row.get("Confirmation code","").strip(),
+                    "guest":        row.get("Guest","").strip(),
+                    "checkin":      row.get("Start date","").strip(),
+                    "checkout":     row.get("End date","").strip(),
+                    "nights":       int(float(row.get("Nights",0) or 0)),
+                    "payout":       float(row.get("Amount",0) or 0),
+                    "gross":        float(row.get("Gross earnings",0) or 0),
+                    "service_fee":  float(row.get("Service fee",0) or 0),
+                    "currency":     row.get("Currency","MYR").strip(),
+                })
+            except Exception:
+                pass
+    return reservations
+
+def reconcile_airbnb_vs_manager(airbnb_rows: list, db_bookings: list) -> dict:
+    """
+    Compare Airbnb CSV bookings vs manager DB bookings for same month.
+    Returns dict with matched, direct/extras, and summary.
+    """
+    # Build lookup of DB bookings by guest name (normalised)
+    def norm(s): return (s or "").upper().strip().split()[0]  # first word match
+
+    db_lookup = {}
+    for b in db_bookings:
+        key = norm(b.get("guest_name",""))
+        if key not in db_lookup:
+            db_lookup[key] = []
+        db_lookup[key].append(b)
+
+    airbnb_names = {norm(r["guest"]) for r in airbnb_rows}
+    db_names     = set(db_lookup.keys())
+
+    matched  = []
+    directs  = []
+
+    # Airbnb guests matched in DB
+    for r in airbnb_rows:
+        key = norm(r["guest"])
+        if key in db_names:
+            db_match = db_lookup[key][0]
+            matched.append({
+                "guest":        r["guest"],
+                "checkin":      r["checkin"],
+                "checkout":     r["checkout"],
+                "nights":       r["nights"],
+                "airbnb_payout":r["payout"],
+                "airbnb_gross": r["gross"],
+                "db_amount":    float(db_match.get("amount",0) or 0),
+                "confirmation": r["confirmation"],
+                "amount_diff":  float(db_match.get("amount",0) or 0) - r["payout"],
+            })
+        # else: in Airbnb but not in DB — cross-month (checkout next month)
+
+    # DB bookings NOT in Airbnb CSV = Direct/Extras
+    for b in db_bookings:
+        key = norm(b.get("guest_name",""))
+        if key not in airbnb_names:
+            directs.append({
+                "guest":    b.get("guest_name",""),
+                "checkin":  b.get("checkin",""),
+                "checkout": b.get("checkout",""),
+                "nights":   int(b.get("nights",0) or 0),
+                "amount":   float(b.get("amount",0) or 0),
+                "source":   b.get("source",""),
+                "db_id":    b.get("id"),
+            })
+
+    airbnb_total = sum(r["payout"] for r in airbnb_rows)
+    db_total     = sum(float(b.get("amount",0) or 0) for b in db_bookings)
+    direct_total = sum(d["amount"] for d in directs)
+
+    return {
+        "matched":       matched,
+        "directs":       directs,
+        "airbnb_total":  airbnb_total,
+        "db_total":      db_total,
+        "direct_total":  direct_total,
+        "difference":    db_total - airbnb_total,
+    }
+
 with tab10:
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.markdown('<p class="card-title">💰 Direct Income & Extras</p>', unsafe_allow_html=True)
@@ -3778,587 +3512,5 @@ with tab10:
                 "💡 **Note for ULU 2 feasibility:** Use Airbnb Income only as the benchmark. "
                 "Direct/Extras are non-recurring and should not be projected as future income."
             )
-
-    st.markdown('</div>', unsafe_allow_html=True)
-
-
-# ══════════════════════════════════════════════
-# TAB 11 — TRENDS & ANALYTICS
-# ══════════════════════════════════════════════
-@st.cache_data(ttl=60)
-def _build_trend_dataframe():
-    """Assemble one row per (year, month) with everything needed for trend
-    charts: ADR, occupancy, net margin %, and Airbnb vs Direct mix.
-    Cached — this pulls several full-table scans and shouldn't re-run on
-    every click."""
-    conn = get_db()
-    all_bookings = conn.execute("SELECT year, month, amount, nights, source FROM bookings", ()).fetchall()
-    all_scans    = conn.execute("SELECT year, month, occupancy_pct FROM manager_monthly_scans", ()).fetchall()
-    conn.close()
-
-    occ_lookup = {}
-    for s in all_scans:
-        occ_lookup[(int(s["year"]), int(s["month"]))] = float(s.get("occupancy_pct") or 0)
-
-    monthly = {}
-    for b in all_bookings:
-        key = (int(b["year"]), int(b["month"]))
-        if key not in monthly:
-            monthly[key] = {"gross": 0.0, "nights": 0, "airbnb": 0.0, "direct": 0.0}
-        amt = float(b.get("amount") or 0)
-        nts = int(b.get("nights") or 0)
-        monthly[key]["gross"] += amt
-        monthly[key]["nights"] += nts
-        if (b.get("source") or "").upper() == "AIRBNB":
-            monthly[key]["airbnb"] += amt
-        else:
-            monthly[key]["direct"] += amt
-
-    rows = []
-    for (yr, mo), v in sorted(monthly.items()):
-        summary = get_monthly_summary(yr, mo)
-        adr = (v["gross"] / v["nights"]) if v["nights"] else 0
-        net_margin = (summary["owner_share"] / summary["gross_income"] * 100) if summary["gross_income"] else 0
-        direct_pct = (v["direct"] / v["gross"] * 100) if v["gross"] else 0
-        rows.append({
-            "year": yr, "month": mo,
-            "label": f"{MONTHS[mo-1]} {yr}",
-            "adr": round(adr, 2),
-            "occupancy_pct": occ_lookup.get((yr, mo), None),
-            "net_margin_pct": round(net_margin, 1),
-            "direct_pct": round(direct_pct, 1),
-            "gross_income": v["gross"],
-            "nights": v["nights"],
-        })
-    return pd.DataFrame(rows)
-
-
-with tab11:
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown('<p class="card-title">📉 Trends & Analytics</p>', unsafe_allow_html=True)
-    st.caption("How ULU 1 is trending over time, built from your existing bookings and manager report data — "
-               "no extra data entry needed.")
-
-    tdf = _build_trend_dataframe()
-
-    if tdf.empty or len(tdf) < 2:
-        st.info("Not enough months of data yet to show trends — this fills in automatically as more "
-                "monthly reports are scanned.")
-    else:
-        # ── EDITABLE ALERT THRESHOLDS ────────────────────────────────────────
-        # These live as settings (not hardcoded) since targets change over time —
-        # e.g. ADR target only applies once the ULU 1 refresh is complete and
-        # live, and should be updated again whenever pricing is revised.
-        with st.expander("⚙️ Adjust Alert Thresholds"):
-            st.caption("Update these whenever pricing or feasibility targets change — the alerts "
-                       "below always check against whatever's set here.")
-            th1, th2, th3 = st.columns(3)
-            adr_min = th1.number_input("ADR target — min (RM/night)",
-                value=float(get_setting("adr_target_min") or 850), step=10.0, key="adr_target_min_input")
-            adr_max = th2.number_input("ADR target — max (RM/night)",
-                value=float(get_setting("adr_target_max") or 1300), step=10.0, key="adr_target_max_input")
-            occ_gate = th3.number_input("Occupancy gate (%)",
-                value=float(get_setting("occupancy_gate_pct") or 75), step=1.0, key="occ_gate_input")
-
-            st.markdown("**ULU 2 peak-season evaluation window**")
-            th4, th5 = st.columns(2)
-            gate_adr_min = th4.number_input("ULU 2 gate — min ADR (RM/night)",
-                value=float(get_setting("gate_adr_min") or 750), step=10.0, key="gate_adr_min_input",
-                help="Separate from the general ADR target above — this is specifically the ULU 2 go/no-go threshold.")
-            gate_occ_min = th5.number_input("ULU 2 gate — min occupancy (%)",
-                value=float(get_setting("gate_occ_min") or 75), step=1.0, key="gate_occ_min_input")
-            th6, th7 = st.columns(2)
-            season_start = th6.text_input("Peak season start (YYYY-MM)",
-                value=get_setting("peak_season_start") or "2026-11", key="season_start_input")
-            season_end = th7.text_input("Peak season end (YYYY-MM)",
-                value=get_setting("peak_season_end") or "2027-02", key="season_end_input")
-
-            if st.button("💾 Save Thresholds", key="btn_save_thresholds"):
-                set_setting("adr_target_min", adr_min)
-                set_setting("adr_target_max", adr_max)
-                set_setting("occupancy_gate_pct", occ_gate)
-                set_setting("gate_adr_min", gate_adr_min)
-                set_setting("gate_occ_min", gate_occ_min)
-                set_setting("peak_season_start", season_start)
-                set_setting("peak_season_end", season_end)
-                st.success("Saved.")
-                st.rerun()
-
-        adr_target_min = float(get_setting("adr_target_min") or 850)
-        adr_target_max = float(get_setting("adr_target_max") or 1300)
-        occupancy_gate = float(get_setting("occupancy_gate_pct") or 75)
-        gate_adr_min = float(get_setting("gate_adr_min") or 750)
-        gate_occ_min = float(get_setting("gate_occ_min") or 75)
-        peak_season_start = get_setting("peak_season_start") or "2026-11"
-        peak_season_end = get_setting("peak_season_end") or "2027-02"
-
-        # ── DETECT PEAK SEASON FROM HISTORY ──────────────────────────────────
-        with st.expander("📅 Detect Peak Season from History"):
-            years_of_data = tdf["year"].nunique()
-            st.caption(f"Average occupancy by calendar month, across {years_of_data} year(s) of data on file. "
-                       f"{'⚠️ Limited reliability with under 2 years of history — treat as a rough signal, not a confident pattern.' if years_of_data < 2 else 'Based on enough history to be a reasonable signal.'}")
-
-            occ_by_cal_month = tdf.dropna(subset=["occupancy_pct"]).groupby("month")["occupancy_pct"].mean()
-            if occ_by_cal_month.empty:
-                st.info("No occupancy data scanned yet — this fills in as monthly reports are added.")
-            else:
-                cal_month_df = pd.DataFrame({
-                    "Month": [MONTHS[m-1] for m in occ_by_cal_month.index],
-                    "Avg Occupancy %": occ_by_cal_month.values
-                }).set_index("Month")
-                st.bar_chart(cal_month_df)
-
-                overall_avg = occ_by_cal_month.mean()
-                peak_months_nums = sorted(occ_by_cal_month[occ_by_cal_month >= overall_avg].index.tolist())
-
-                # Find the longest contiguous run of peak months, wrapping across year-end (e.g. Nov-Dec-Jan-Feb)
-                def _longest_contiguous_run(months_list):
-                    if not months_list:
-                        return []
-                    extended = set(months_list) | {m+12 for m in months_list if m <= 12}
-                    best_run, current_run = [], []
-                    for m in range(1, 25):
-                        if m in extended or (m > 12 and (m-12) in months_list):
-                            current_run.append(m)
-                        else:
-                            if len(current_run) > len(best_run):
-                                best_run = current_run
-                            current_run = []
-                    if len(current_run) > len(best_run):
-                        best_run = current_run
-                    return [((m-1) % 12) + 1 for m in best_run]
-
-                suggested_run = _longest_contiguous_run(peak_months_nums)
-
-                if suggested_run:
-                    suggested_names = [MONTHS[m-1] for m in suggested_run]
-                    st.markdown(f"**Months at or above average occupancy ({overall_avg:.0f}%):** " +
-                                ", ".join(MONTHS[m-1] for m in peak_months_nums))
-                    st.markdown(f"**Suggested contiguous peak window:** {' → '.join(suggested_names)}")
-
-                    if st.button("Use this as the peak season window", key="btn_use_suggested_season"):
-                        latest_yr = int(tdf["year"].max())
-                        start_m = suggested_run[0]
-                        end_m = suggested_run[-1]
-                        start_yr = latest_yr
-                        end_yr = start_yr + 1 if end_m < start_m else start_yr
-                        set_setting("peak_season_start", f"{start_yr}-{start_m:02d}")
-                        set_setting("peak_season_end", f"{end_yr}-{end_m:02d}")
-                        st.success(f"Peak season window updated to {start_yr}-{start_m:02d} → {end_yr}-{end_m:02d}. "
-                                   f"Scroll down to the threshold settings to review.")
-                        st.rerun()
-                else:
-                    st.info("No clear contiguous peak pattern detected yet.")
-
-        # ── ULU 2 GO / NO-GO VERDICT ─────────────────────────────────────────
-        st.markdown("#### 🚦 ULU 2 Go / No-Go")
-        try:
-            sy, sm = [int(x) for x in peak_season_start.split("-")]
-            ey, em = [int(x) for x in peak_season_end.split("-")]
-            season_df = tdf[
-                ((tdf["year"] > sy) | ((tdf["year"] == sy) & (tdf["month"] >= sm))) &
-                ((tdf["year"] < ey) | ((tdf["year"] == ey) & (tdf["month"] <= em)))
-            ]
-        except Exception:
-            season_df = pd.DataFrame()
-            st.error("Peak season dates above are malformed — use YYYY-MM format.")
-
-        if season_df.empty:
-            st.info(f"No data yet within the peak-season window ({peak_season_start} to {peak_season_end}). "
-                    f"This fills in as monthly reports are scanned through that period.")
-        else:
-            avg_adr = season_df["adr"].mean()
-            avg_occ = season_df["occupancy_pct"].mean()  # NaN-safe; ignores months with no scan yet
-            months_covered = len(season_df)
-            try:
-                total_window_months = (ey - sy) * 12 + (em - sm) + 1
-            except Exception:
-                total_window_months = months_covered
-            window_complete = months_covered >= total_window_months
-
-            adr_pass = avg_adr >= gate_adr_min
-            occ_pass = pd.notna(avg_occ) and avg_occ >= gate_occ_min
-
-            if adr_pass and occ_pass and window_complete:
-                verdict, color = "✅ GO", "success"
-            elif adr_pass and occ_pass and not window_complete:
-                verdict, color = "🟡 ON TRACK (window not yet complete)", "warning"
-            elif window_complete:
-                verdict, color = "🔴 NO-GO", "error"
-            else:
-                verdict, color = "🟡 NOT YET THERE", "warning"
-
-            vc1, vc2, vc3, vc4 = st.columns(4)
-            vc1.metric("Verdict", verdict)
-            vc2.metric("Avg ADR (window)", f"RM {avg_adr:,.0f}",
-                       delta=f"{avg_adr - gate_adr_min:+,.0f} vs RM{gate_adr_min:,.0f} gate")
-            vc3.metric("Avg Occupancy (window)",
-                       f"{avg_occ:.0f}%" if pd.notna(avg_occ) else "—",
-                       delta=f"{avg_occ - gate_occ_min:+.0f}pp vs {gate_occ_min:.0f}% gate" if pd.notna(avg_occ) else None)
-            vc4.metric("Months Covered", f"{months_covered} / {total_window_months}")
-
-            getattr(st, color)(
-                f"**{verdict}** — averaged across {peak_season_start} to {peak_season_end}: "
-                f"RM{avg_adr:,.0f} ADR ({'meets' if adr_pass else 'below'} the RM{gate_adr_min:,.0f} gate), "
-                f"{avg_occ:.0f}% occupancy "
-                f"({'meets' if occ_pass else 'below'} the {gate_occ_min:.0f}% gate)."
-                if pd.notna(avg_occ) else
-                f"**{verdict}** — averaged across {peak_season_start} to {peak_season_end}: "
-                f"RM{avg_adr:,.0f} ADR ({'meets' if adr_pass else 'below'} the RM{gate_adr_min:,.0f} gate). "
-                f"Occupancy data incomplete for this window."
-            )
-
-            with st.expander("Month-by-month breakdown for this window"):
-                season_display = season_df[["label", "adr", "occupancy_pct"]].copy()
-                season_display.columns = ["Month", "ADR (RM)", "Occupancy %"]
-                season_display["ADR (RM)"] = season_display["ADR (RM)"].apply(lambda x: f"{x:,.0f}")
-                season_display["Occupancy %"] = season_display["Occupancy %"].apply(
-                    lambda x: f"{x:.0f}%" if pd.notna(x) else "—")
-                st.dataframe(season_display, use_container_width=True, hide_index=True)
-
-            # ── AFFORDABLE CONSTRUCTION BUDGET CEILING ────────────────────────
-            # Only meaningful once trending toward GO — a NO-GO doesn't need a
-            # budget ceiling since the project shouldn't proceed at all.
-            if adr_pass and occ_pass and pd.notna(avg_occ):
-                st.markdown("#### 💰 If GO — Target Construction Budget Ceiling")
-                st.caption("Works backward from ULU 1's achieved rate/occupancy to what ULU 2's construction "
-                           "budget can actually support. Overspending this ceiling risks turning a real GO "
-                           "into a loss-making decision even at the same rate and occupancy.")
-
-                with st.expander("⚙️ Adjust Budget Assumptions"):
-                    bc1, bc2 = st.columns(2)
-                    payback_years = bc1.number_input("Target payback period (years)",
-                        value=float(get_setting("ulu2_payback_years") or 5), step=1.0, key="payback_years_input")
-                    default_margin = tdf["net_margin_pct"].tail(6).mean() if len(tdf) >= 1 else 30.0
-                    assumed_margin = bc2.number_input("Assumed net margin % (ULU 2)",
-                        value=float(get_setting("ulu2_assumed_margin") or default_margin), step=1.0,
-                        key="assumed_margin_input",
-                        help="Defaults to ULU 1's own recent average net margin, as a reasonable proxy "
-                             "since ULU 2 will likely share a similar cost structure and profit-sharing terms.")
-                    planned_capex = st.number_input("Planned/Actual Construction Budget (RM)",
-                        value=float(get_setting("ulu2_planned_capex") or 616600), step=1000.0,
-                        key="planned_capex_input", help="Defaults to the QS cost estimate on file.")
-                    if st.button("💾 Save Budget Assumptions", key="btn_save_budget"):
-                        set_setting("ulu2_payback_years", payback_years)
-                        set_setting("ulu2_assumed_margin", assumed_margin)
-                        set_setting("ulu2_planned_capex", planned_capex)
-                        st.success("Saved.")
-                        st.rerun()
-
-                payback_years = float(get_setting("ulu2_payback_years") or 5)
-                assumed_margin = float(get_setting("ulu2_assumed_margin") or default_margin)
-                planned_capex = float(get_setting("ulu2_planned_capex") or 616600)
-
-                projected_nights_per_year = 365 * (avg_occ / 100)
-                projected_gross_per_year = avg_adr * projected_nights_per_year
-                projected_net_per_year = projected_gross_per_year * (assumed_margin / 100)
-                max_affordable_capex = projected_net_per_year * payback_years
-
-                bc_col1, bc_col2, bc_col3 = st.columns(3)
-                bc_col1.metric("Projected Net Income / Year", fmt_myr(projected_net_per_year),
-                    help=f"RM{avg_adr:,.0f} ADR × {projected_nights_per_year:.0f} nights/yr × {assumed_margin:.0f}% margin")
-                bc_col2.metric(f"Affordable Budget ({payback_years:.0f}-yr payback)", fmt_myr(max_affordable_capex))
-                budget_delta = max_affordable_capex - planned_capex
-                bc_col3.metric("Planned Budget", fmt_myr(planned_capex),
-                    delta=f"{budget_delta:+,.0f} headroom" if budget_delta >= 0 else f"{budget_delta:,.0f} over ceiling")
-
-                if planned_capex > max_affordable_capex:
-                    over_by = planned_capex - max_affordable_capex
-                    implied_years = (planned_capex / projected_net_per_year) if projected_net_per_year > 0 else float('inf')
-                    st.error(
-                        f"**⚠️ Planned budget exceeds the affordable ceiling by {fmt_myr(over_by)}.** "
-                        f"At the planned {fmt_myr(planned_capex)} spend, actual payback would be "
-                        f"~{implied_years:.1f} years, not the {payback_years:.0f}-year target — this is exactly "
-                        f"how a real GO on rate/occupancy can still end up a poor investment. Consider trimming "
-                        f"scope, phasing the build, or extending the target payback period if {implied_years:.1f} "
-                        f"years is still acceptable."
-                    )
-                else:
-                    st.success(
-                        f"**✅ Planned budget is within the affordable ceiling** — {fmt_myr(budget_delta)} of "
-                        f"headroom remaining at the {payback_years:.0f}-year payback target."
-                    )
-
-        st.divider()
-
-        # ── ALERTS & RECOMMENDATIONS ─────────────────────────────────────────
-        st.markdown("#### 🔔 Alerts & Recommendations")
-        alerts = []
-
-        latest = tdf.iloc[-1]
-        prior3 = tdf.iloc[-4:-1] if len(tdf) >= 4 else tdf.iloc[:-1]
-
-        # ADR vs current target range (editable above)
-        if latest["adr"] > 0:
-            if latest["adr"] < adr_target_min:
-                alerts.append(("warning",
-                    f"**ADR below target** — {latest['label']} averaged **RM{latest['adr']:,.0f}/night**, "
-                    f"under the RM{adr_target_min:,.0f}–{adr_target_max:,.0f} target. If this is expected "
-                    f"(e.g. refresh not yet live), no action needed — otherwise worth checking rates are "
-                    f"actually updated on all channels."))
-            else:
-                alerts.append(("success",
-                    f"**ADR on target** — {latest['label']} averaged **RM{latest['adr']:,.0f}/night**, "
-                    f"within the RM{adr_target_min:,.0f}–{adr_target_max:,.0f} target range."))
-
-        # Occupancy vs configurable gate
-        if pd.notna(latest["occupancy_pct"]):
-            if latest["occupancy_pct"] < occupancy_gate:
-                alerts.append(("warning",
-                    f"**Occupancy below gate** — {latest['label']} occupancy was "
-                    f"**{latest['occupancy_pct']:.0f}%**, below the {occupancy_gate:.0f}% threshold. "
-                    f"Keep watching this through peak season (Nov–Feb)."))
-            else:
-                alerts.append(("success",
-                    f"**Occupancy clearing the gate** — {latest['label']} occupancy was "
-                    f"**{latest['occupancy_pct']:.0f}%**, at or above the {occupancy_gate:.0f}% threshold."))
-
-        # Net margin trend — declining over last 3 months vs prior
-        if len(prior3) >= 2:
-            avg_prior_margin = prior3["net_margin_pct"].mean()
-            if latest["net_margin_pct"] < avg_prior_margin - 5:
-                alerts.append(("warning",
-                    f"**Margin slipping** — net margin was **{latest['net_margin_pct']:.0f}%** in "
-                    f"{latest['label']}, down from a ~{avg_prior_margin:.0f}% average over the prior months. "
-                    f"Worth checking OpEx Breakdown for a cost spike this period."))
-
-        if not alerts:
-            st.success("No issues flagged this period — ADR, occupancy, and margins all look on track.")
-        else:
-            for kind, msg in alerts:
-                (st.warning if kind == "warning" else st.success)(msg)
-
-        st.divider()
-
-        # ── ADR TREND ─────────────────────────────────────────────────────────
-        st.markdown("#### Average Daily Rate (ADR) Trend")
-        st.caption(f"Gross income ÷ nights sold, by month. Current target: "
-                   f"RM{adr_target_min:,.0f}–{adr_target_max:,.0f} (adjustable above).")
-
-        recent3 = tdf.tail(3)
-        recent3_gross = recent3["gross_income"].sum()
-        recent3_nights = recent3["nights"].sum()
-        recent3_adr = (recent3_gross / recent3_nights) if recent3_nights else 0
-
-        recent12 = tdf.tail(12)
-        recent12_gross = recent12["gross_income"].sum()
-        recent12_nights = recent12["nights"].sum()
-        recent12_adr = (recent12_gross / recent12_nights) if recent12_nights else 0
-
-        alltime_gross = tdf["gross_income"].sum()
-        alltime_nights = tdf["nights"].sum()
-        alltime_adr = (alltime_gross / alltime_nights) if alltime_nights else 0
-
-        radr1, radr2, radr3 = st.columns(3)
-        radr1.metric(f"Recent 3-Month ADR", f"RM {recent3_adr:,.0f}",
-                     delta=f"{recent3_adr - alltime_adr:+,.0f} vs all-time",
-                     help=f"{', '.join(recent3['label'])}. Weighted by actual nights sold. "
-                          "Shows the most current pricing performance.")
-        radr2.metric(f"Latest 12-Month ADR", f"RM {recent12_adr:,.0f}",
-                     delta=f"{recent12_adr - alltime_adr:+,.0f} vs all-time",
-                     help=f"Trailing 12 months ({recent12['label'].iloc[0]} to {recent12['label'].iloc[-1]}). "
-                          "The right figure for Go/No-Go and competitor comparisons — recent enough to reflect "
-                          "current pricing, stable enough to smooth out single-month noise.")
-        radr3.metric("All-Time ADR", f"RM {alltime_adr:,.0f}",
-                     help="Blended across your full booking history since operations began — includes "
-                          "bookings made before rate revisions. Useful for long-term context only.")
-
-        adr_chart_df = tdf.set_index("label")[["adr"]].rename(columns={"adr": "ADR (RM/night)"})
-        st.line_chart(adr_chart_df)
-
-        st.divider()
-
-        # ── OCCUPANCY TREND ──────────────────────────────────────────────────
-        st.markdown("#### Occupancy % Trend")
-        st.caption(f"From each month's manager report. Current gate: {occupancy_gate:.0f}%+ occupancy "
-                   f"(adjustable above).")
-        occ_chart_df = tdf.dropna(subset=["occupancy_pct"]).set_index("label")[["occupancy_pct"]].rename(
-            columns={"occupancy_pct": "Occupancy %"})
-        if not occ_chart_df.empty:
-            st.line_chart(occ_chart_df)
-        else:
-            st.caption("No occupancy data yet — this comes from the Manager's Monthly Report scan.")
-
-        st.divider()
-
-        # ── NET MARGIN TREND ─────────────────────────────────────────────────
-        st.markdown("#### Net Margin % Trend")
-        st.caption("Owner net profit ÷ gross income, by month. Shows whether profitability is improving "
-                   "or just revenue is growing while costs eat into it.")
-        margin_chart_df = tdf.set_index("label")[["net_margin_pct"]].rename(columns={"net_margin_pct": "Net Margin %"})
-        st.line_chart(margin_chart_df)
-
-        st.divider()
-
-        # ── COMPETITOR WATCHLIST & RATE TRACKER ──────────────────────────────
-        COMPETITOR_TYPOLOGIES = [
-            "Paddy Field / Countryside Villa",
-            "Hillside / Jungle Villa",
-            "Beachfront Villa",
-            "Boutique Resort",
-            "Other",
-        ]
-        ULU1_TYPOLOGY = "Paddy Field / Countryside Villa"
-
-        st.markdown("#### Competitor Rate Tracker")
-        st.caption("A curated watchlist rather than random checks — matched to ULU 1's actual positioning "
-                   "(paddy field/countryside, couples/design-focused), not beachfront or family resorts "
-                   "that aren't real competitors for the same guest search.")
-
-        with st.expander("📋 Manage Competitor Watchlist"):
-            with st.form("add_watchlist_competitor", clear_on_submit=True):
-                wc1, wc2 = st.columns(2)
-                wl_name = wc1.text_input("Competitor Name", placeholder="e.g. [property name]")
-                wl_typology = wc2.selectbox("Typology", COMPETITOR_TYPOLOGIES,
-                    help=f"ULU 1 is a {ULU1_TYPOLOGY} — only same-typology properties are real competitors "
-                         f"for the same guest search. Others are useful as ceiling/floor references only.")
-                wl_location = st.text_input("Location", placeholder="e.g. Padang Matsirat, Langkawi")
-                wl_notes = st.text_input("Notes (optional)", placeholder="e.g. similar bedroom count, price tier reference")
-                if st.form_submit_button("➕ Add to Watchlist", use_container_width=True):
-                    if not wl_name:
-                        st.error("Competitor name is required.")
-                    else:
-                        conn = get_db()
-                        conn.execute(
-                            "INSERT INTO competitor_watchlist (name,typology,location,notes,active,added_date) VALUES (?,?,?,?,?,?)",
-                            (wl_name, wl_typology, wl_location, wl_notes, 1, datetime.date.today().isoformat())
-                        )
-                        conn.commit(); conn.close()
-                        st.success(f"Added {wl_name} to the watchlist.")
-                        st.rerun()
-
-            conn = get_db()
-            watchlist_rows = conn.execute("SELECT * FROM competitor_watchlist ORDER BY typology, name", ()).fetchall()
-            conn.close()
-            watchlist = [dict(r) for r in watchlist_rows if r.get("active", 1)]
-
-            if watchlist:
-                st.markdown("**Current watchlist:** (edit the name once you know the exact villa name, then Save)")
-                for w in watchlist:
-                    wcol1, wcol2, wcol3 = st.columns([4, 1.2, 1])
-                    match_tag = "✓ same typology" if w["typology"] == ULU1_TYPOLOGY else "reference only"
-                    new_name = wcol1.text_input(
-                        f"Name — {w['typology']} ({match_tag}) — {w.get('location','') or '—'}",
-                        value=w["name"], key=f"wl_name_{w['id']}"
-                    )
-                    if wcol2.button("💾 Save", key=f"wl_save_{w['id']}"):
-                        if new_name.strip() and new_name.strip() != w["name"]:
-                            conn = get_db()
-                            old_name = w["name"]
-                            conn.execute("UPDATE competitor_watchlist SET name=? WHERE id=?",
-                                         (new_name.strip(), w["id"]))
-                            # Keep historical rate checks linked — they're matched by name string, not id.
-                            conn.execute("UPDATE competitor_rates SET competitor_name=? WHERE competitor_name=?",
-                                         (new_name.strip(), old_name))
-                            conn.commit(); conn.close()
-                            st.success(f"Renamed to {new_name.strip()} — rate history carried over.")
-                            st.rerun()
-                    if wcol3.button("Remove", key=f"wl_del_{w['id']}"):
-                        conn = get_db()
-                        conn.execute("UPDATE competitor_watchlist SET active=0 WHERE id=?", (w["id"],))
-                        conn.commit(); conn.close()
-                        st.rerun()
-            else:
-                st.info(f"Watchlist is empty. Add properties that are genuinely comparable to ULU 1 — "
-                        f"same typology ({ULU1_TYPOLOGY}), similar guest search intent. A beachfront or "
-                        f"family resort won't be competing for the same booking, even if it's nearby.")
-
-        # ── Quarterly due-for-check alert ─────────────────────────────────────
-        if watchlist:
-            today = datetime.date.today()
-            due_for_check = []
-            for w in watchlist:
-                last_checked = w.get("last_checked_date")
-                if not last_checked:
-                    due_for_check.append(w["name"])
-                else:
-                    try:
-                        lc_date = datetime.date.fromisoformat(last_checked)
-                        if (today - lc_date).days >= 90:
-                            due_for_check.append(w["name"])
-                    except Exception:
-                        due_for_check.append(w["name"])
-            if due_for_check:
-                st.warning(f"📌 **Due for quarterly rate check:** {', '.join(due_for_check)}")
-
-        with st.expander("➕ Log a Competitor Rate Check"):
-            if not watchlist:
-                st.caption("Add at least one competitor to the watchlist above first.")
-            else:
-                with st.form("add_competitor_rate", clear_on_submit=True):
-                    watchlist_names = [w["name"] for w in watchlist]
-                    cr1, cr2 = st.columns(2)
-                    cr_name = cr1.selectbox("Competitor", watchlist_names)
-                    cr_date = cr2.text_input("Date Checked (YYYY-MM-DD)", value=datetime.date.today().isoformat())
-                    cr3, cr4 = st.columns(2)
-                    cr_rate = cr3.number_input("Rate Seen (RM/night)", min_value=0.0, step=10.0, format="%.2f")
-                    cr_source = cr4.selectbox("Source", ["Airbnb","Booking.com","Direct website","Other"])
-                    cr_notes = st.text_input("Notes (optional)", placeholder="e.g. weekday rate, low-season, 2BR")
-                    if st.form_submit_button("💾 Save Rate Check", use_container_width=True):
-                        if not cr_name or cr_rate <= 0:
-                            st.error("Competitor and rate are required.")
-                        else:
-                            conn = get_db()
-                            conn.execute(
-                                "INSERT INTO competitor_rates (date_checked,competitor_name,rate_rm,source,notes) VALUES (?,?,?,?,?)",
-                                (cr_date, cr_name, cr_rate, cr_source, cr_notes)
-                            )
-                            conn.execute(
-                                "UPDATE competitor_watchlist SET last_checked_date=? WHERE name=?",
-                                (cr_date, cr_name)
-                            )
-                            conn.commit(); conn.close()
-                            _build_trend_dataframe.clear()
-                            st.success("Saved.")
-                            st.rerun()
-
-        conn = get_db()
-        comp_rows = conn.execute("SELECT * FROM competitor_rates ORDER BY date_checked DESC", ()).fetchall()
-        conn.close()
-
-        if not comp_rows:
-            st.info("No competitor rate checks logged yet.")
-        else:
-            comp_df = pd.DataFrame([dict(r) for r in comp_rows])
-            watchlist_by_name = {w["name"]: w["typology"] for w in watchlist} if watchlist else {}
-            comp_df["typology"] = comp_df["competitor_name"].map(watchlist_by_name)
-            same_typology_df = comp_df[comp_df["typology"] == ULU1_TYPOLOGY]
-
-            benchmark_df = same_typology_df if not same_typology_df.empty else comp_df
-            latest_comp_avg = benchmark_df.sort_values("date_checked", ascending=False).head(5)["rate_rm"].astype(float).mean()
-
-            mc1, mc2, mc3 = st.columns(3)
-            mc1.metric("ULU 1's Latest 12-Month ADR", f"RM {recent12_adr:,.0f}",
-                       help="Trailing 12 months, not a single month or all-time — matches the ~4-month "
-                            "competitor rate refresh cadence better than a legacy blended figure.")
-            mc2.metric("Same-Typology Competitor Avg (last 5 checks)", f"RM {latest_comp_avg:,.0f}")
-            delta_pct = ((recent12_adr - latest_comp_avg) / latest_comp_avg * 100) if latest_comp_avg else 0
-            mc3.metric("ULU 1 vs Competitors", f"{delta_pct:+.0f}%",
-                       help="Positive = ULU 1 priced above the same-typology competitor average. "
-                            "Beachfront/resort properties are excluded from this benchmark.")
-
-            st.markdown("**Rate check log:**")
-            display_comp = comp_df.copy()
-            display_comp["rate_rm"] = display_comp["rate_rm"].apply(lambda x: fmt_myr(x))
-            display_comp = display_comp[["date_checked","competitor_name","typology","rate_rm","source","notes"]]
-            display_comp.columns = ["Date","Competitor","Typology","Rate","Source","Notes"]
-            st.dataframe(display_comp, use_container_width=True, hide_index=True)
-
-        st.divider()
-
-        # ── SEASONALITY: SAME MONTH YEAR-OVER-YEAR ──────────────────────────
-        st.markdown("#### Seasonality — Same Month, Year-over-Year")
-        st.caption("Compare this month's performance against the same month last year, to separate "
-                   "genuine trend from normal seasonal swings.")
-        pivot_df = tdf.pivot_table(index="month", columns="year", values="gross_income", aggfunc="sum")
-        pivot_df.index = [MONTHS[m-1] for m in pivot_df.index]
-        pivot_df = pivot_df.reindex(MONTHS).dropna(how="all")
-        if not pivot_df.empty:
-            display_pivot = pivot_df.copy()
-            for col in display_pivot.columns:
-                display_pivot[col] = display_pivot[col].apply(lambda x: fmt_myr(x) if pd.notna(x) else "—")
-            st.dataframe(display_pivot, use_container_width=True)
-        else:
-            st.caption("Not enough years of data yet for a year-over-year comparison.")
 
     st.markdown('</div>', unsafe_allow_html=True)

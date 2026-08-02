@@ -3828,7 +3828,6 @@ def _build_trend_dataframe():
             "net_margin_pct": round(net_margin, 1),
             "direct_pct": round(direct_pct, 1),
             "gross_income": v["gross"],
-            "nights": v["nights"],
         })
     return pd.DataFrame(rows)
 
@@ -4134,35 +4133,6 @@ with tab11:
         st.markdown("#### Average Daily Rate (ADR) Trend")
         st.caption(f"Gross income ÷ nights sold, by month. Current target: "
                    f"RM{adr_target_min:,.0f}–{adr_target_max:,.0f} (adjustable above).")
-
-        recent3 = tdf.tail(3)
-        recent3_gross = recent3["gross_income"].sum()
-        recent3_nights = recent3["nights"].sum()
-        recent3_adr = (recent3_gross / recent3_nights) if recent3_nights else 0
-
-        recent12 = tdf.tail(12)
-        recent12_gross = recent12["gross_income"].sum()
-        recent12_nights = recent12["nights"].sum()
-        recent12_adr = (recent12_gross / recent12_nights) if recent12_nights else 0
-
-        alltime_gross = tdf["gross_income"].sum()
-        alltime_nights = tdf["nights"].sum()
-        alltime_adr = (alltime_gross / alltime_nights) if alltime_nights else 0
-
-        radr1, radr2, radr3 = st.columns(3)
-        radr1.metric(f"Recent 3-Month ADR", f"RM {recent3_adr:,.0f}",
-                     delta=f"{recent3_adr - alltime_adr:+,.0f} vs all-time",
-                     help=f"{', '.join(recent3['label'])}. Weighted by actual nights sold. "
-                          "Shows the most current pricing performance.")
-        radr2.metric(f"Latest 12-Month ADR", f"RM {recent12_adr:,.0f}",
-                     delta=f"{recent12_adr - alltime_adr:+,.0f} vs all-time",
-                     help=f"Trailing 12 months ({recent12['label'].iloc[0]} to {recent12['label'].iloc[-1]}). "
-                          "The right figure for Go/No-Go and competitor comparisons — recent enough to reflect "
-                          "current pricing, stable enough to smooth out single-month noise.")
-        radr3.metric("All-Time ADR", f"RM {alltime_adr:,.0f}",
-                     help="Blended across your full booking history since operations began — includes "
-                          "bookings made before rate revisions. Useful for long-term context only.")
-
         adr_chart_df = tdf.set_index("label")[["adr"]].rename(columns={"adr": "ADR (RM/night)"})
         st.line_chart(adr_chart_df)
 
@@ -4233,27 +4203,12 @@ with tab11:
             watchlist = [dict(r) for r in watchlist_rows if r.get("active", 1)]
 
             if watchlist:
-                st.markdown("**Current watchlist:** (edit the name once you know the exact villa name, then Save)")
+                st.markdown("**Current watchlist:**")
                 for w in watchlist:
-                    wcol1, wcol2, wcol3 = st.columns([4, 1.2, 1])
+                    wcol1, wcol2 = st.columns([5, 1])
                     match_tag = "✓ same typology" if w["typology"] == ULU1_TYPOLOGY else "reference only"
-                    new_name = wcol1.text_input(
-                        f"Name — {w['typology']} ({match_tag}) — {w.get('location','') or '—'}",
-                        value=w["name"], key=f"wl_name_{w['id']}"
-                    )
-                    if wcol2.button("💾 Save", key=f"wl_save_{w['id']}"):
-                        if new_name.strip() and new_name.strip() != w["name"]:
-                            conn = get_db()
-                            old_name = w["name"]
-                            conn.execute("UPDATE competitor_watchlist SET name=? WHERE id=?",
-                                         (new_name.strip(), w["id"]))
-                            # Keep historical rate checks linked — they're matched by name string, not id.
-                            conn.execute("UPDATE competitor_rates SET competitor_name=? WHERE competitor_name=?",
-                                         (new_name.strip(), old_name))
-                            conn.commit(); conn.close()
-                            st.success(f"Renamed to {new_name.strip()} — rate history carried over.")
-                            st.rerun()
-                    if wcol3.button("Remove", key=f"wl_del_{w['id']}"):
+                    wcol1.markdown(f"**{w['name']}** — {w['typology']} ({match_tag}) — {w.get('location','') or '—'}")
+                    if wcol2.button("Remove", key=f"wl_del_{w['id']}"):
                         conn = get_db()
                         conn.execute("UPDATE competitor_watchlist SET active=0 WHERE id=?", (w["id"],))
                         conn.commit(); conn.close()
@@ -4324,15 +4279,14 @@ with tab11:
             comp_df["typology"] = comp_df["competitor_name"].map(watchlist_by_name)
             same_typology_df = comp_df[comp_df["typology"] == ULU1_TYPOLOGY]
 
+            latest_own_adr = latest["adr"]
             benchmark_df = same_typology_df if not same_typology_df.empty else comp_df
             latest_comp_avg = benchmark_df.sort_values("date_checked", ascending=False).head(5)["rate_rm"].astype(float).mean()
 
             mc1, mc2, mc3 = st.columns(3)
-            mc1.metric("ULU 1's Latest 12-Month ADR", f"RM {recent12_adr:,.0f}",
-                       help="Trailing 12 months, not a single month or all-time — matches the ~4-month "
-                            "competitor rate refresh cadence better than a legacy blended figure.")
+            mc1.metric("ULU 1's Latest ADR", f"RM {latest_own_adr:,.0f}")
             mc2.metric("Same-Typology Competitor Avg (last 5 checks)", f"RM {latest_comp_avg:,.0f}")
-            delta_pct = ((recent12_adr - latest_comp_avg) / latest_comp_avg * 100) if latest_comp_avg else 0
+            delta_pct = ((latest_own_adr - latest_comp_avg) / latest_comp_avg * 100) if latest_comp_avg else 0
             mc3.metric("ULU 1 vs Competitors", f"{delta_pct:+.0f}%",
                        help="Positive = ULU 1 priced above the same-typology competitor average. "
                             "Beachfront/resort properties are excluded from this benchmark.")

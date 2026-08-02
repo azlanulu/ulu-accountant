@@ -10,6 +10,7 @@ import base64
 import json
 import datetime
 import io
+import urllib.parse
 from pathlib import Path
 
 import pandas as pd
@@ -35,218 +36,6 @@ SUPABASE_KEY = st.secrets.get("SUPABASE_KEY", os.environ.get("SUPABASE_KEY",""))
 @st.cache_resource
 def get_supabase() -> Client:
     return create_client(SUPABASE_URL, SUPABASE_KEY)
-
-# ─────────────────────────────────────────────
-# PAYMENT ATTACHMENTS — CLAIM INVOICE + PROOF OF PAYMENT
-# Uploaded to Supabase Storage (survives Streamlit Cloud restarts) AND saved
-# locally to a "Payment Voucher Attachments" folder for direct accountant/
-# auditor access via OneDrive — same folder name/convention already used.
-# Create the bucket once in Supabase: Storage → New bucket → "ulu1-attachments" (private).
-# ─────────────────────────────────────────────
-PAYMENT_BUCKET = "ulu1-attachments"
-ACCOUNTING_FOLDER_ROOT = "Accounting Folder - Payment Vouchers"
-PV_ATTACHMENTS_FOLDER = os.path.join(ACCOUNTING_FOLDER_ROOT, "Payment Voucher Attachments")
-PV_VOUCHERS_FOLDER = os.path.join(ACCOUNTING_FOLDER_ROOT, "Vouchers")
-
-def parse_attachment_paths(value):
-    """Attachment path columns may hold a single legacy path (old records)
-    or a JSON list of paths (multi-file records going forward). Normalise
-    to a list either way."""
-    if not value:
-        return []
-    try:
-        parsed = json.loads(value)
-        if isinstance(parsed, list):
-            return parsed
-        return [str(parsed)]
-    except Exception:
-        return [value]  # legacy plain string path
-
-def is_running_on_cloud():
-    return bool(os.environ.get("STREAMLIT_SHARING_MODE")) or \
-           os.environ.get("HOME","").startswith("/home/appuser") or \
-           "/mount/src" in os.path.abspath(__file__)
-
-def upload_payment_file(file_bytes, file_name, kind):
-    """Upload a claim invoice / proof-of-payment file to Supabase Storage.
-    Returns the storage path (to store in the DB) or None on failure."""
-    if not file_bytes:
-        return None
-    sb = get_supabase()
-    ext = Path(file_name).suffix.lower() or ".bin"
-    safe_name = f"{datetime.datetime.now().strftime('%Y%m%d%H%M%S%f')}{ext}"
-    storage_path = f"{kind}/{safe_name}"
-    try:
-        sb.storage.from_(PAYMENT_BUCKET).upload(
-            storage_path, file_bytes,
-            file_options={"content-type": "application/octet-stream"}
-        )
-        return storage_path
-    except Exception as e:
-        st.error(f"Attachment upload failed: {e}")
-        return None
-
-def get_payment_file_url(storage_path, expires_in=1209600):
-    """Return a temporary signed URL to view/download a stored attachment (14-day expiry)."""
-    if not storage_path:
-        return None
-    sb = get_supabase()
-    try:
-        res = sb.storage.from_(PAYMENT_BUCKET).create_signed_url(storage_path, expires_in)
-        return res.get("signedURL") or res.get("signed_url") or res.get("signedUrl")
-    except Exception as e:
-        st.warning(f"Couldn't generate a link for '{storage_path}': {e}")
-        return None
-
-def save_payment_attachment_local(file_bytes, file_name, subfolder, voucher_no, index=0):
-    """Save a copy into the local Payment Voucher Attachments folder for direct
-    auditor/accountant access via OneDrive sync. Only persists when running
-    locally — Streamlit Cloud's disk resets on redeploy, so Supabase Storage
-    (above) is the source of truth and this is a convenience copy."""
-    if not file_bytes or is_running_on_cloud():
-        return None
-    folder = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                           PV_ATTACHMENTS_FOLDER, subfolder)
-    os.makedirs(folder, exist_ok=True)
-    ext = Path(file_name).suffix or ".bin"
-    suffix = f"_{index+1}" if index > 0 else ""
-    fn = f"{voucher_no}_{subfolder.replace(' ','_')}{suffix}{ext}"
-    local_path = os.path.join(folder, fn)
-    with open(local_path, "wb") as _f:
-        _f.write(file_bytes)
-    return local_path
-
-@st.cache_data(ttl=300, show_spinner=False)
-def cached_read_local_file(path, mtime_hint=None):
-    """Read a local file's bytes, cached. mtime_hint busts the cache if the
-    file is replaced. Returns None if the path doesn't exist — this check
-    itself is cached too, which matters a lot on OneDrive-synced folders
-    where Files On-Demand can make os.path.exists a network round trip.
-    Previously this ran uncached, once per row, on EVERY app rerun
-    regardless of which tab was open — the likely main cause of multi-
-    minute lag as the CapEx/scan lists grew."""
-    if not path or not os.path.exists(path):
-        return None
-    with open(path, "rb") as _f:
-        return _f.read()
-
-def save_voucher_pdf_local(pdf_bytes, voucher_no):
-    """Save the generated voucher PDF itself into the Vouchers subfolder.
-    Only persists when running locally, same as save_payment_attachment_local."""
-    if not pdf_bytes or is_running_on_cloud():
-        return None
-    folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), PV_VOUCHERS_FOLDER)
-    os.makedirs(folder, exist_ok=True)
-    local_path = os.path.join(folder, f"{voucher_no}.pdf")
-    with open(local_path, "wb") as _f:
-        _f.write(pdf_bytes)
-    return local_path
-
-# ─────────────────────────────────────────────
-# AIRBNB CSV RECONCILE + DIRECT INCOME & EXTRAS
-# Moved here from near Tab 10 — must be defined before the Airbnb CSV & Reconcile
-# sub-tab under Scan Receipts runs, since Streamlit executes top-to-bottom on every
-# rerun. This was a pre-existing ordering bug causing 'parse_airbnb_csv is not defined'.
-# ─────────────────────────────────────────────
-DIRECT_INCOME_TYPES = [
-    "Direct Booking (Cash/Transfer)",
-    "Extra Mattress",
-    "Baby Cot",
-    "Extra Cleaning",
-    "Damage Compensation",
-    "Cancellation Fee",
-    "Other Extra Charge",
-]
-
-def parse_airbnb_csv(file_bytes: bytes) -> list:
-    """Parse Airbnb CSV export and return list of reservation dicts."""
-    import csv, io
-    text = file_bytes.decode("utf-8-sig")
-    reader = csv.DictReader(io.StringIO(text))
-    reservations = []
-    for row in reader:
-        if row.get("Type","").strip() == "Reservation":
-            try:
-                reservations.append({
-                    "confirmation": row.get("Confirmation code","").strip(),
-                    "guest":        row.get("Guest","").strip(),
-                    "checkin":      row.get("Start date","").strip(),
-                    "checkout":     row.get("End date","").strip(),
-                    "nights":       int(float(row.get("Nights",0) or 0)),
-                    "payout":       float(row.get("Amount",0) or 0),
-                    "gross":        float(row.get("Gross earnings",0) or 0),
-                    "service_fee":  float(row.get("Service fee",0) or 0),
-                    "currency":     row.get("Currency","MYR").strip(),
-                })
-            except Exception:
-                pass
-    return reservations
-
-def reconcile_airbnb_vs_manager(airbnb_rows: list, db_bookings: list) -> dict:
-    """
-    Compare Airbnb CSV bookings vs manager DB bookings for same month.
-    Returns dict with matched, direct/extras, and summary.
-    """
-    # Build lookup of DB bookings by guest name (normalised)
-    def norm(s): return (s or "").upper().strip().split()[0]  # first word match
-
-    db_lookup = {}
-    for b in db_bookings:
-        key = norm(b.get("guest_name",""))
-        if key not in db_lookup:
-            db_lookup[key] = []
-        db_lookup[key].append(b)
-
-    airbnb_names = {norm(r["guest"]) for r in airbnb_rows}
-    db_names     = set(db_lookup.keys())
-
-    matched  = []
-    directs  = []
-
-    # Airbnb guests matched in DB
-    for r in airbnb_rows:
-        key = norm(r["guest"])
-        if key in db_names:
-            db_match = db_lookup[key][0]
-            matched.append({
-                "guest":        r["guest"],
-                "checkin":      r["checkin"],
-                "checkout":     r["checkout"],
-                "nights":       r["nights"],
-                "airbnb_payout":r["payout"],
-                "airbnb_gross": r["gross"],
-                "db_amount":    float(db_match.get("amount",0) or 0),
-                "confirmation": r["confirmation"],
-                "amount_diff":  float(db_match.get("amount",0) or 0) - r["payout"],
-            })
-        # else: in Airbnb but not in DB — cross-month (checkout next month)
-
-    # DB bookings NOT in Airbnb CSV = Direct/Extras
-    for b in db_bookings:
-        key = norm(b.get("guest_name",""))
-        if key not in airbnb_names:
-            directs.append({
-                "guest":    b.get("guest_name",""),
-                "checkin":  b.get("checkin",""),
-                "checkout": b.get("checkout",""),
-                "nights":   int(b.get("nights",0) or 0),
-                "amount":   float(b.get("amount",0) or 0),
-                "source":   b.get("source",""),
-                "db_id":    b.get("id"),
-            })
-
-    airbnb_total = sum(r["payout"] for r in airbnb_rows)
-    db_total     = sum(float(b.get("amount",0) or 0) for b in db_bookings)
-    direct_total = sum(d["amount"] for d in directs)
-
-    return {
-        "matched":       matched,
-        "directs":       directs,
-        "airbnb_total":  airbnb_total,
-        "db_total":      db_total,
-        "direct_total":  direct_total,
-        "difference":    db_total - airbnb_total,
-    }
 
 # ─────────────────────────────────────────────
 # SUPABASE DB ADAPTER
@@ -305,12 +94,7 @@ class SupabaseCursor:
                 self._handle_delete(sql, p)
 
         except Exception as e:
-            # Re-raise so callers can catch and surface the real error.
-            # Only show st.error for SELECT failures (non-fatal reads).
-            if sql.upper().startswith("SELECT"):
-                st.error(f"DB read error: {e}\nSQL: {sql}\nParams: {p}")
-            else:
-                raise  # Let INSERT/UPDATE/DELETE callers handle and display
+            st.error(f"DB error: {e}\nSQL: {sql}\nParams: {p}")
 
     def _table_from_sql(self, sql):
         import re
@@ -448,55 +232,31 @@ class SupabaseCursor:
         table = self._table_from_sql(sql)
         if not table:
             return
-        set_match   = re.search(r'SET\s+(.+?)\s+WHERE', sql, re.IGNORECASE | re.DOTALL)
-        where_match = re.search(r'WHERE\s+(.+?)$',      sql, re.IGNORECASE | re.DOTALL)
+        set_match  = re.search(r'SET\s+(.+?)\s+WHERE', sql, re.IGNORECASE | re.DOTALL)
+        where_match= re.search(r'WHERE\s+(.+?)$', sql, re.IGNORECASE | re.DOTALL)
         if not set_match:
             return
         set_clause   = set_match.group(1).strip()
+        set_cols     = [s.strip().split('=')[0].strip() for s in set_clause.split(',')]
         where_clause = where_match.group(1).strip() if where_match else ""
 
-        # ── Parse SET clause carefully ────────────────────────────────────────
-        # Each assignment is either:
-        #   col = ?           → consume next positional param
-        #   col = 'literal'   → use the literal value directly (no param consumed)
-        # A naive len(set_cols) count breaks when literals are present.
-        record = {}
-        param_idx = 0
-        for assignment in set_clause.split(','):
-            assignment = assignment.strip()
-            # col = 'literal string'
-            lit_match = re.match(r"(\w+)\s*=\s*'([^']*)'", assignment)
-            if lit_match:
-                record[lit_match.group(1)] = lit_match.group(2)
-                continue
-            # col = NULL
-            null_match = re.match(r"(\w+)\s*=\s*NULL", assignment, re.IGNORECASE)
-            if null_match:
-                record[null_match.group(1)] = None
-                continue
-            # col = ?  → consume next param
-            placeholder_match = re.match(r"(\w+)\s*=\s*\?", assignment)
-            if placeholder_match:
-                col = placeholder_match.group(1)
-                record[col] = p[param_idx] if param_idx < len(p) else None
-                param_idx += 1
-                continue
+        n_set = len(set_cols)
+        set_vals   = p[:n_set]
+        where_vals = p[n_set:]
 
-        where_vals = list(p[param_idx:])
-
+        record = {col: set_vals[i] for i, col in enumerate(set_cols)}
         q = self.sb.table(table).update(record)
 
         # Apply WHERE
         if where_vals and 'id' in where_clause.lower():
             q = q.eq('id', where_vals[0])
         elif where_vals and where_clause:
+            # Parse simple year/month conditions
             conditions = re.split(r'\s+AND\s+', where_clause, flags=re.IGNORECASE)
-            widx = 0
-            for cond in conditions:
+            for i, cond in enumerate(conditions):
                 col_match = re.match(r'(\w+)\s*=\s*\?', cond.strip(), re.IGNORECASE)
-                if col_match and widx < len(where_vals):
-                    q = q.eq(col_match.group(1), where_vals[widx])
-                    widx += 1
+                if col_match and i < len(where_vals):
+                    q = q.eq(col_match.group(1), where_vals[i])
         q.execute()
 
     def _handle_delete(self, sql, p):
@@ -559,58 +319,15 @@ st.markdown("""
 
   .stApp { background-color: #F5F0E8; }
 
-  /* ── Header: ID-anchored so no global span rule can override it ── */
-  #ulu-header, #ulu-header * {
-    color: #F5F0E8 !important;
-  }
-  #ulu-header {
+  .app-header {
     background: linear-gradient(135deg, #2a3528 0%, #1a2418 100%);
+    color: #F5F0E8;
     padding: 28px 36px 22px 36px;
     border-radius: 12px;
     margin-bottom: 24px;
   }
-  #ulu-header h1 {
-    font-family:'DM Serif Display',serif;
-    font-size:2rem; margin:0 0 4px 0;
-    color:#F5F0E8 !important;
-  }
-  #ulu-header p {
-    margin:0; color:#A8B8A5 !important;
-    font-size:0.85rem; letter-spacing:0.05em; text-transform:uppercase;
-  }
-
-  /* ── Global contrast & font-size fixes ── */
-  /* Body text, markdown, labels */
-  [class*="css"] p, [class*="css"] li,
-  .stMarkdown p, .stMarkdown li,
-  label, .stTextInput label, .stSelectbox label,
-  .stNumberInput label, .stTextArea label,
-  .stDateInput label, .stFileUploader label {
-    color: #1C1C1A !important;
-    font-size: 1rem !important;
-  }
-  /* Input/textarea field values */
-  input, textarea,
-  .stTextInput input, .stTextArea textarea,
-  .stNumberInput input {
-    color: #1C1C1A !important;
-    font-size: 1rem !important;
-  }
-  /* Selectbox displayed value */
-  [data-baseweb="select"] [data-baseweb="tag"],
-  [data-baseweb="select"] div[class*="singleValue"],
-  [data-baseweb="select"] div[class*="placeholder"] {
-    color: #1C1C1A !important;
-    font-size: 1rem !important;
-  }
-  /* Dropdown portal menu items — rendered outside normal DOM */
-  [data-baseweb="popover"] li,
-  [data-baseweb="menu"] li,
-  [data-baseweb="list-item"],
-  ul[data-baseweb="menu"] span {
-    color: #1C1C1A !important;
-    font-size: 1rem !important;
-  }
+  .app-header h1 { font-family:'DM Serif Display',serif; font-size:2rem; margin:0 0 4px 0; color:#F5F0E8; }
+  .app-header p  { margin:0; color:#A8B8A5; font-size:0.85rem; letter-spacing:0.05em; text-transform:uppercase; }
 
   .card {
     background:#FFFFFF;
@@ -662,12 +379,6 @@ st.markdown("""
   .badge-mbed  { background:#C4856A; color:white; padding:2px 10px; border-radius:12px; font-size:0.75rem; }
   .badge-airbnb  { background:#FF5A5F; color:white; padding:2px 8px; border-radius:10px; font-size:0.72rem; }
   .badge-direct  { background:#2a3528; color:white; padding:2px 8px; border-radius:10px; font-size:0.72rem; }
-
-  /* Payment voucher status badges */
-  .badge-paid     { background:#2a7a2a; color:white; padding:2px 10px; border-radius:12px; font-size:0.8rem; font-weight:600; }
-  .badge-pending  { background:#b8860b; color:white; padding:2px 10px; border-radius:12px; font-size:0.8rem; font-weight:600; }
-  .badge-partial  { background:#4a90d9; color:white; padding:2px 10px; border-radius:12px; font-size:0.8rem; font-weight:600; }
-  .badge-cancelled{ background:#555; color:white; padding:2px 10px; border-radius:12px; font-size:0.8rem; font-weight:600; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -700,7 +411,7 @@ OPEX_CATEGORIES = [
     "Marketing",
     "Insurance",
     "Assessment / Quit Rent",
-    "Property Management Fee (Archmedia)",
+    "Management Fee (Archmedia)",
     "Miscellaneous OpEx",
 ]
 
@@ -721,7 +432,6 @@ CAPEX_CATEGORIES = [
 # OpEx vs CapEx classification rule (for reference)
 CAPEX_THRESHOLD = 1000  # Items above RM1,000 with multi-year life = CapEx
 
-@st.cache_data(ttl=300)
 def get_setting(key):
     conn = get_db()
     r = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
@@ -729,13 +439,14 @@ def get_setting(key):
     return r["value"] if r else None
 
 def set_setting(key, value):
-    conn = get_db()
-    conn.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, str(value)))
-    conn.commit()
-    conn.close()
-    get_setting.clear()  # invalidate cache — this setting just changed
+    # NOTE: bypasses the SQL adapter and calls Supabase directly. The adapter's
+    # regex-based INSERT parser requires an explicit "(cols) VALUES (...)" form;
+    # "INSERT OR REPLACE INTO settings VALUES (?,?)" has no column list, so it
+    # was silently failing to write on the cloud version. upsert() also correctly
+    # handles both the create and update case on the "key" primary key.
+    sb = get_supabase()
+    sb.table("settings").upsert({"key": key, "value": str(value)}, on_conflict="key").execute()
 
-@st.cache_data(ttl=300)
 def get_year_month_list():
     """Return list of (year, month) tuples from operation start to now."""
     start_y = int(get_setting("operation_start_year") or 2024)
@@ -762,7 +473,6 @@ def operation_year(year, month):
 def fmt_myr(v):
     return f"RM {float(v or 0):,.2f}"
 
-@st.cache_data(ttl=30)
 def get_monthly_summary(year, month):
     conn = get_db()
     gross_income = conn.execute(
@@ -799,7 +509,6 @@ def get_monthly_summary(year, month):
         "owner_share": owner_share,
     }
 
-@st.cache_data(ttl=30)
 def get_yearly_summary(year):
     # Get all months that have bookings or expenses — avoid GROUP BY which breaks Supabase adapter
     conn = get_db()
@@ -892,11 +601,11 @@ Rules: total_amount is a plain number, no RM symbol."""
         return json.loads(raw)
 
 # ─────────────────────────────────────────────
-# AI EXTRACTION — AZARY'S MONTHLY BILLING REPORT
+# AI EXTRACTION — PROPERTY MANAGER'S MONTHLY BILLING REPORT
 # ─────────────────────────────────────────────
 def extract_manager_report(file_bytes, file_name, api_key):
     """
-    Extract full structured data from Azary's monthly billing report.
+    Extract full structured data from the Property Manager's monthly billing report.
     Returns dict with bookings list, expenses list, and summary figures.
     """
     import anthropic as _ant
@@ -1018,6 +727,47 @@ def save_manager_scan_file(file_bytes, file_name, year, month):
 
 
 # ─────────────────────────────────────────────
+# PAYMENT ATTACHMENT STORAGE (Supabase Storage)
+# Unlike scan_path above, these files must actually survive on the cloud
+# deployment (receipts + proof of payment are the audit trail), so they
+# are uploaded to a private Supabase Storage bucket rather than local disk.
+# Create the bucket once in Supabase: Storage → New bucket → "payment-attachments" (private).
+# ─────────────────────────────────────────────
+PAYMENT_BUCKET = "payment-attachments"
+
+def upload_payment_file(file_bytes, file_name, kind):
+    """Upload a receipt / proof-of-payment file to Supabase Storage.
+    kind: 'receipt' or 'proof' — used to namespace the storage path.
+    Returns the storage path (to store in the DB) or None on failure."""
+    if not file_bytes:
+        return None
+    sb = get_supabase()
+    ext = Path(file_name).suffix.lower() or ".bin"
+    safe_name = f"{datetime.datetime.now().strftime('%Y%m%d%H%M%S%f')}{ext}"
+    storage_path = f"{kind}/{safe_name}"
+    try:
+        sb.storage.from_(PAYMENT_BUCKET).upload(
+            storage_path, file_bytes,
+            file_options={"content-type": "application/octet-stream"}
+        )
+        return storage_path
+    except Exception as e:
+        st.error(f"Attachment upload failed: {e}")
+        return None
+
+def get_payment_file_url(storage_path, expires_in=3600):
+    """Return a temporary signed URL to view/download a stored attachment."""
+    if not storage_path:
+        return None
+    sb = get_supabase()
+    try:
+        res = sb.storage.from_(PAYMENT_BUCKET).create_signed_url(storage_path, expires_in)
+        return res.get("signedURL") or res.get("signed_url") or res.get("signedUrl")
+    except Exception:
+        return None
+
+
+# ─────────────────────────────────────────────
 # PDF MONTHLY REPORT
 # ─────────────────────────────────────────────
 def generate_monthly_report(year, month, summary, bookings, mgr_expenses, personal_expenses):
@@ -1066,7 +816,7 @@ def generate_monthly_report(year, month, summary, bookings, mgr_expenses, person
         box_row("Personal Expenses (ULU Share)", f"({fmt_myr(summary['personal_expenses'])})"),
         box_row("Gross Operating Cost", f"({fmt_myr(summary['gross_op_cost'])})"),
         box_row("Net Profit Before Sharing", fmt_myr(summary["net_before_sharing"])),
-        box_row(f"Co-Host Share ({summary['cohost_pct']:.0f}%)", f"({fmt_myr(summary['cohost_share'])})"),
+        box_row(f"Management Fee ({summary['cohost_pct']:.0f}%)", f"({fmt_myr(summary['cohost_share'])})"),
         box_row("Owner Net Profit (Your Income)", fmt_myr(summary["owner_share"]), highlight=True),
     ]
     sum_tbl = Table(summary_data, colWidths=[W*0.65, W*0.35])
@@ -1193,14 +943,167 @@ def generate_monthly_report(year, month, summary, bookings, mgr_expenses, person
     return buffer.getvalue()
 
 
+# ─────────────────────────────────────────────
+# PDF PAYMENT VOUCHER
+# ─────────────────────────────────────────────
+def generate_payment_voucher_pdf(payment):
+    """Generate a one-page payment voucher PDF for a single payments row."""
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4,
+                            rightMargin=20*mm, leftMargin=20*mm,
+                            topMargin=18*mm, bottomMargin=18*mm)
+
+    INK    = colors.HexColor("#1C1C1A")
+    GREEN  = colors.HexColor("#2a3528")
+    ACCENT = colors.HexColor("#C4856A")
+    LIGHT  = colors.HexColor("#E5DDD0")
+    GREY   = colors.HexColor("#6B6560")
+
+    s_normal = ParagraphStyle("n", fontName="Helvetica", fontSize=9.5, leading=14, textColor=INK)
+    s_small  = ParagraphStyle("s", fontName="Helvetica", fontSize=8, leading=12, textColor=GREY)
+    s_bold   = ParagraphStyle("b", fontName="Helvetica-Bold", fontSize=9.5, leading=14, textColor=INK)
+    s_title  = ParagraphStyle("t", fontName="Helvetica-Bold", fontSize=18, leading=22, textColor=INK)
+    s_sub    = ParagraphStyle("su", fontName="Helvetica-Bold", fontSize=11, leading=14, textColor=GREEN)
+    s_label  = ParagraphStyle("l", fontName="Helvetica", fontSize=7.5, textColor=GREY, spaceAfter=1)
+    s_status = ParagraphStyle("st", fontName="Helvetica-Bold", fontSize=11, textColor=colors.white, alignment=TA_CENTER)
+
+    story = []
+
+    company_name = get_setting("archmedia_company_name") or "Archmedia Sdn Bhd"
+    company_reg  = get_setting("archmedia_reg_no") or ""
+    company_addr = get_setting("archmedia_address") or ""
+
+    # Header
+    hdr_tbl = Table([[
+        Paragraph("PAYMENT VOUCHER", s_title),
+        Paragraph(f"Voucher No. PV-{payment['id']:05d}", s_bold),
+    ]], colWidths=[110*mm, 60*mm])
+    hdr_tbl.setStyle(TableStyle([
+        ("VALIGN",(0,0),(-1,-1),"MIDDLE"),
+        ("ALIGN",(1,0),(1,0),"RIGHT"),
+    ]))
+    story.append(hdr_tbl)
+    story.append(Spacer(1, 4))
+    story.append(Paragraph("ULU Mahsuri Villa · Operations Accountant", s_small))
+    story.append(Spacer(1, 10))
+    story.append(HRFlowable(width="100%", thickness=1, color=GREEN, spaceAfter=12))
+
+    # Issuer / status row
+    status_colors = {"Paid": colors.HexColor("#4a5e47"), "Partial": ACCENT, "Pending": colors.HexColor("#B0413E")}
+    status_bg = status_colors.get(payment.get("status","Pending"), GREY)
+
+    issuer_block = [
+        Paragraph("ISSUED BY", s_label),
+        Paragraph(company_name, s_bold),
+    ]
+    if company_reg:
+        issuer_block.append(Paragraph(f"Reg. No. {company_reg}", s_small))
+    if company_addr:
+        issuer_block.append(Paragraph(company_addr.replace("\n","<br/>"), s_small))
+
+    status_cell = Table([[Paragraph(payment.get("status","Pending").upper(), s_status)]],
+                         colWidths=[45*mm], rowHeights=[14*mm])
+    status_cell.setStyle(TableStyle([
+        ("BACKGROUND",(0,0),(-1,-1), status_bg),
+        ("VALIGN",(0,0),(-1,-1),"MIDDLE"),
+        ("ALIGN",(0,0),(-1,-1),"CENTER"),
+        ("ROUNDEDCORNERS",[6,6,6,6]),
+    ]))
+
+    top_tbl = Table([[issuer_block, status_cell]], colWidths=[120*mm, 50*mm])
+    top_tbl.setStyle(TableStyle([("VALIGN",(0,0),(-1,-1),"TOP"), ("ALIGN",(1,0),(1,0),"RIGHT")]))
+    story.append(top_tbl)
+    story.append(Spacer(1, 16))
+
+    # Payee / voucher details
+    def detail_row(label, value):
+        return [Paragraph(label, s_label), Paragraph(str(value) if value not in (None,"") else "—", s_normal)]
+
+    details = [
+        detail_row("Payee Type", payment.get("payee_type","")),
+        detail_row("Payee Name", payment.get("payee_name","")),
+        detail_row("Category", payment.get("category","")),
+        detail_row("Description", payment.get("description","")),
+        detail_row("Payment Date", payment.get("payment_date","")),
+        detail_row("Payment Method", payment.get("payment_method","")),
+        detail_row("Reference No.", payment.get("reference_no","")),
+    ]
+    det_tbl = Table(details, colWidths=[45*mm, 105*mm])
+    det_tbl.setStyle(TableStyle([
+        ("TOPPADDING",(0,0),(-1,-1),5), ("BOTTOMPADDING",(0,0),(-1,-1),5),
+        ("LINEBELOW",(0,0),(-1,-1),0.3, LIGHT),
+        ("VALIGN",(0,0),(-1,-1),"TOP"),
+    ]))
+    story.append(det_tbl)
+    story.append(Spacer(1, 14))
+
+    # Amount box
+    amt_due  = float(payment.get("amount_due") or 0)
+    amt_paid = float(payment.get("amount_paid") or 0)
+    balance  = amt_due - amt_paid
+
+    amt_tbl = Table([
+        [Paragraph("Amount Due", s_label), Paragraph(f"RM {amt_due:,.2f}", s_bold)],
+        [Paragraph("Amount Paid", s_label), Paragraph(f"RM {amt_paid:,.2f}", s_bold)],
+        [Paragraph("Balance", s_label), Paragraph(f"RM {balance:,.2f}", ParagraphStyle(
+            "balv", fontName="Helvetica-Bold", fontSize=13, textColor=ACCENT))],
+    ], colWidths=[40*mm, 110*mm])
+    amt_tbl.setStyle(TableStyle([
+        ("BACKGROUND",(0,0),(-1,-1), colors.HexColor("#FAF8F5")),
+        ("BOX",(0,0),(-1,-1), 0.5, LIGHT),
+        ("TOPPADDING",(0,0),(-1,-1),8), ("BOTTOMPADDING",(0,0),(-1,-1),8),
+        ("LEFTPADDING",(0,0),(-1,-1),10),
+        ("LINEBELOW",(0,0),(1,1),0.3, LIGHT),
+    ]))
+    story.append(amt_tbl)
+    story.append(Spacer(1, 10))
+
+    if payment.get("notes"):
+        story.append(Paragraph("NOTES", s_label))
+        story.append(Paragraph(payment["notes"], s_small))
+        story.append(Spacer(1, 10))
+
+    attach_notes = []
+    if payment.get("receipt_path"):
+        attach_notes.append("✓ Receipt attached")
+    if payment.get("proof_of_payment_path"):
+        attach_notes.append("✓ Proof of payment attached")
+    if attach_notes:
+        story.append(Paragraph(" · ".join(attach_notes), s_small))
+        story.append(Spacer(1, 10))
+
+    # Signature lines
+    story.append(Spacer(1, 24))
+    sig_tbl = Table([
+        ["_______________________________", "_______________________________"],
+        ["Prepared By", "Approved By"],
+    ], colWidths=[75*mm, 75*mm])
+    sig_tbl.setStyle(TableStyle([
+        ("TEXTCOLOR",(0,0),(-1,0), LIGHT),
+        ("TEXTCOLOR",(0,1),(-1,1), GREY),
+        ("FONTSIZE",(0,0),(-1,-1), 8.5),
+        ("TOPPADDING",(0,1),(-1,1), 2),
+    ]))
+    story.append(sig_tbl)
+
+    story.append(Spacer(1, 18))
+    story.append(HRFlowable(width="100%", thickness=0.5, color=LIGHT, spaceAfter=8))
+    story.append(Paragraph(
+        f"Generated on {datetime.datetime.now().strftime('%d %B %Y %H:%M')} · ULU Mahsuri Villa Operations Accountant",
+        s_small
+    ))
+
+    doc.build(story)
+    return buffer.getvalue()
+
 
 # ─────────────────────────────────────────────
 # HEADER
 # ─────────────────────────────────────────────
 st.markdown("""
-<div id="ulu-header">
-  <h1 style="color:#F5F0E8 !important;">🌾 ULU Mahsuri Villa</h1>
-  <p style="color:#A8B8A5 !important;">Operations Accountant · Langkawi · Personal Income Tracking</p>
+<div class="app-header">
+  <h1>🌾 ULU Mahsuri Villa</h1>
+  <p>Operations Accountant · Langkawi · Personal Income Tracking</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -1231,12 +1134,74 @@ with st.sidebar:
         st.session_state["ulu_api_key"] = api_key_input
 
     st.divider()
+
+    with st.expander("🏢 Property Manager & Company Details"):
+        st.caption("Used on payment vouchers in the Payments & Vouchers tab.")
+
+        pm_name_val = st.text_input(
+            "Property Manager Name",
+            value=get_setting("property_manager_name") or "",
+            key="setting_pm_name",
+            placeholder="e.g. Azary bin ..."
+        )
+        pm_phone_val = st.text_input(
+            "Property Manager WhatsApp No.",
+            value=get_setting("property_manager_phone") or "",
+            key="setting_pm_phone",
+            placeholder="e.g. 60123456789",
+            help="Country code + number, no + or leading 0."
+        )
+        archmedia_name_val = st.text_input(
+            "Management Company Name",
+            value=get_setting("archmedia_company_name") or "Archmedia Sdn Bhd",
+            key="setting_archmedia_name"
+        )
+        archmedia_regno_val = st.text_input(
+            "Company Registration No.",
+            value=get_setting("archmedia_reg_no") or "",
+            key="setting_archmedia_regno",
+            placeholder="e.g. 123456-A"
+        )
+        archmedia_address_val = st.text_area(
+            "Company Address",
+            value=get_setting("archmedia_address") or "",
+            key="setting_archmedia_address",
+            height=70
+        )
+        archmedia_bank_val = st.text_input(
+            "Bank Name",
+            value=get_setting("archmedia_bank_name") or "",
+            key="setting_archmedia_bank"
+        )
+        archmedia_acct_val = st.text_input(
+            "Bank Account No.",
+            value=get_setting("archmedia_bank_account") or "",
+            key="setting_archmedia_acct"
+        )
+        archmedia_contact_val = st.text_input(
+            "Contact (phone / email)",
+            value=get_setting("archmedia_contact") or "",
+            key="setting_archmedia_contact"
+        )
+
+        if st.button("💾 Save Details", key="save_pm_settings", use_container_width=True):
+            set_setting("property_manager_name", pm_name_val)
+            set_setting("property_manager_phone", pm_phone_val)
+            set_setting("archmedia_company_name", archmedia_name_val)
+            set_setting("archmedia_reg_no", archmedia_regno_val)
+            set_setting("archmedia_address", archmedia_address_val)
+            set_setting("archmedia_bank_name", archmedia_bank_val)
+            set_setting("archmedia_bank_account", archmedia_acct_val)
+            set_setting("archmedia_contact", archmedia_contact_val)
+            st.success("Saved.")
+
+    st.divider()
     st.caption(f"DB: {DB_PATH}")
 
 # ─────────────────────────────────────────────
 # TABS
 # ─────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
     "📅  Monthly Entry",
     "🧾  Scan Receipts",
     "📊  Monthly P&L",
@@ -1246,8 +1211,6 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs([
     "📋  OpEx Breakdown",
     "📦  Accountant",
     "💳  Payments & Vouchers",
-    "💰  Direct Income & Extras",
-    "📉  Trends & Analytics",
 ])
 
 # ══════════════════════════════════════════════
@@ -1311,7 +1274,7 @@ with tab1:
     with col_right:
         st.markdown('<div class="card">', unsafe_allow_html=True)
         st.markdown('<p class="card-title">➕ Manager\'s Monthly Expenses</p>', unsafe_allow_html=True)
-        st.caption("Key in line by line from Azary's monthly submission PDF")
+        st.caption("Key in line by line from the Property Manager's monthly submission PDF")
 
         MANAGER_ITEMS = [
             "Pool Cleaner","WiFi (Unifi)","Water Filter (Coway)",
@@ -1360,10 +1323,9 @@ with tab1:
 # TAB 2 — SCAN RECEIPTS
 # ══════════════════════════════════════════════
 with tab2:
-    scan_subtab1, scan_subtab2, scan_subtab3 = st.tabs([
+    scan_subtab1, scan_subtab2 = st.tabs([
         "📋 Manager's Monthly Report",
-        "📊 Airbnb CSV & Reconcile",
-        "🧾 Personal Receipts (Owner)",
+        "🧾 Personal Receipts (Owner)"
     ])
 
     # ── SUB-TAB A: MANAGER'S MONTHLY REPORT ────────────────────────────────────
@@ -1437,7 +1399,7 @@ with tab2:
                 fc3.metric("Net Profit", fmt_myr(r.get("net_profit", 0)))
                 fc4, fc5 = st.columns(2)
                 fc4.metric("Owner Share (70%)", fmt_myr(r.get("owner_share", 0)))
-                fc5.metric("Co-Host Share (30%)", fmt_myr(r.get("cohost_share", 0)))
+                fc5.metric("Management Fee (30%)", fmt_myr(r.get("cohost_share", 0)))
 
                 st.markdown("**Bookings extracted:**")
                 bk_preview = []
@@ -1550,7 +1512,7 @@ with tab2:
                 st.markdown(
                     "<div style='text-align:center;padding:60px 0;color:#A89F91;'>"
                     "<div style='font-size:3rem'>📋</div>"
-                    "<p>Upload Azary's monthly billing report on the left.<br>"
+                    "<p>Upload the Property Manager's monthly billing report on the left.<br>"
                     "AI will extract all bookings and expenses for your review before saving.</p>"
                     "</div>", unsafe_allow_html=True
                 )
@@ -1571,21 +1533,21 @@ with tab2:
                     sc1.metric("Gross Income", fmt_myr(s['gross_income']))
                     sc2.metric("Total OpEx", fmt_myr(s['total_opex']))
                     sc3.metric("Owner Share", fmt_myr(s['owner_share']))
-                    sc4.metric("Co-Host Share", fmt_myr(s['cohost_share']))
+                    sc4.metric("Management Fee", fmt_myr(s['cohost_share']))
 
                     st.caption(f"File: {s['file_name']} | Scanned: {s['created_at']}")
 
                     dl_col, del_col = st.columns([3, 1])
                     sp = s["scan_path"]
-                    _scan_bytes = cached_read_local_file(sp) if sp else None
-                    if _scan_bytes:
-                        ext_sp = sp.split(".")[-1].lower()
-                        mime_sp = "application/pdf" if ext_sp == "pdf" else f"image/{ext_sp}"
-                        dl_col.download_button(
-                            f"⬇️ Download Original Report",
-                            data=_scan_bytes, file_name=os.path.basename(sp), mime=mime_sp,
-                            key=f"mgr_dl_{s['id']}"
-                        )
+                    if sp and os.path.exists(sp):
+                        with open(sp, "rb") as _f:
+                            ext_sp = sp.split(".")[-1].lower()
+                            mime_sp = "application/pdf" if ext_sp == "pdf" else f"image/{ext_sp}"
+                            dl_col.download_button(
+                                f"⬇️ Download Original Report",
+                                data=_f.read(), file_name=os.path.basename(sp), mime=mime_sp,
+                                key=f"mgr_dl_{s['id']}"
+                            )
                     else:
                         dl_col.caption("Original file not found on disk.")
 
@@ -1611,163 +1573,8 @@ with tab2:
         else:
             st.info("No monthly reports scanned yet.")
 
-    # ── SUB-TAB B: AIRBNB CSV & RECONCILE ──────────────────────────────────────
+    # ── SUB-TAB B: PERSONAL RECEIPTS (OWNER) ───────────────────────────────────
     with scan_subtab2:
-        st.markdown("**Upload the Airbnb monthly CSV** — app compares against the Manager's report already scanned and identifies Direct bookings and Extra charges automatically.")
-
-        ym_list_ab = get_year_month_list()
-        ym_labels_ab = [f"{MONTHS[m-1]} {y} ({operation_year(y,m)})" for y,m in ym_list_ab]
-        sel_idx_ab = st.selectbox(
-            "Month to reconcile",
-            range(len(ym_labels_ab)),
-            format_func=lambda i: ym_labels_ab[i],
-            key="ab_month"
-        )
-        ab_year, ab_month = ym_list_ab[sel_idx_ab]
-
-        ab_upload = st.file_uploader(
-            "Upload Airbnb CSV for this month",
-            type=["csv"], key="ab_csv_upload"
-        )
-        if ab_upload:
-            ab_bytes = ab_upload.read()
-            st.session_state["ab_csv_bytes"] = ab_bytes
-            st.session_state["ab_csv_name"]  = ab_upload.name
-            st.success(f"✓ {ab_upload.name} ready")
-
-        if st.session_state.get("ab_csv_bytes") and st.button(
-            "🔍 Compare Airbnb vs Manager Report", type="primary", key="btn_ab_reconcile"
-        ):
-            with st.spinner("Reconciling..."):
-                try:
-                    airbnb_rows = parse_airbnb_csv(st.session_state["ab_csv_bytes"])
-                    conn = get_db()
-                    db_bk = conn.execute(
-                        "SELECT * FROM bookings WHERE year=? AND month=? ORDER BY checkin",
-                        (ab_year, ab_month)
-                    ).fetchall()
-                    conn.close()
-                    db_bookings = [dict(b) for b in db_bk]
-
-                    if not db_bookings:
-                        st.warning(f"No Manager report found for {MONTHS[ab_month-1]} {ab_year}. "
-                                   f"Please scan the Manager's Monthly Report first (sub-tab above).")
-                    else:
-                        result = reconcile_airbnb_vs_manager(airbnb_rows, db_bookings)
-                        st.session_state["ab_reconcile_result"] = result
-                        st.session_state["ab_reconcile_year"]   = ab_year
-                        st.session_state["ab_reconcile_month"]  = ab_month
-                        if result["directs"]:
-                            st.success(f"✓ Done — {len(result['directs'])} Direct/Extra entries identified.")
-                        else:
-                            st.success("✓ Done — all bookings matched. No Direct/Extras this month.")
-                except Exception as e:
-                    st.error(f"Reconciliation failed: {e}")
-
-        # Show results
-        if "ab_reconcile_result" in st.session_state:
-            res  = st.session_state["ab_reconcile_result"]
-            r_yr = st.session_state["ab_reconcile_year"]
-            r_mo = st.session_state["ab_reconcile_month"]
-
-            st.markdown(f"### {MONTHS[r_mo-1]} {r_yr} — Reconciliation Result")
-
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Manager Total", fmt_myr(res["db_total"]))
-            m2.metric("Airbnb Payout", fmt_myr(res["airbnb_total"]))
-            m3.metric("Direct/Extras", fmt_myr(res["direct_total"]))
-            m4.metric("Difference",    fmt_myr(res["difference"]))
-
-            # Matched
-            st.markdown("---")
-            st.markdown("**✅ Airbnb Bookings — Matched:**")
-            if res["matched"]:
-                st.dataframe(pd.DataFrame([{
-                    "Guest":         m["guest"],
-                    "Check-in":      m["checkin"],
-                    "Check-out":     m["checkout"],
-                    "Nights":        m["nights"],
-                    "Airbnb Payout": fmt_myr(m["airbnb_payout"]),
-                    "Airbnb Gross":  fmt_myr(m["airbnb_gross"]),
-                    "DB Amount":     fmt_myr(m["db_amount"]),
-                    "Diff":          fmt_myr(m["amount_diff"]) if abs(m["amount_diff"]) > 0.10 else "✅",
-                    "Confirmation":  m["confirmation"],
-                } for m in res["matched"]]), use_container_width=True, hide_index=True)
-
-            # Directs
-            if res["directs"]:
-                st.markdown("---")
-                st.markdown("**⚡ Direct Bookings & Extras — Not in Airbnb CSV:**")
-                st.warning(f"{len(res['directs'])} booking(s) in Manager report not found in Airbnb — classify below then save.")
-
-                direct_entries = []
-                for i, d in enumerate(res["directs"]):
-                    with st.expander(
-                        f"**{d['guest']}** — {fmt_myr(d['amount'])} — {d['checkin']} to {d['checkout']}",
-                        expanded=True
-                    ):
-                        dc1, dc2 = st.columns(2)
-                        d_type   = dc1.selectbox("Income Type", DIRECT_INCOME_TYPES, key=f"ab_type_{i}")
-                        d_method = dc2.selectbox("Payment Method",
-                            ["Cash","Bank Transfer","DuitNow","Other"], key=f"ab_method_{i}")
-                        d_ref    = st.text_input("Reference / Remarks", key=f"ab_ref_{i}",
-                            placeholder="e.g. Cash on arrival, bank transfer ref")
-                        d_notes  = st.text_input("Notes", key=f"ab_notes_{i}")
-                        direct_entries.append({
-                            "guest":          d["guest"],
-                            "amount":         d["amount"],
-                            "checkin":        d["checkin"],
-                            "income_type":    d_type,
-                            "payment_method": d_method,
-                            "reference":      d_ref,
-                            "notes":          d_notes,
-                        })
-
-                st.markdown("---")
-                if st.button("💾 Save Direct/Extra Entries to Register", type="primary", key="btn_ab_save"):
-                    conn = get_db()
-                    saved = 0
-                    errors = []
-                    for entry in direct_entries:
-                        try:
-                            conn.execute(
-                                """INSERT INTO direct_income
-                                   (year,month,guest_name,income_type,amount,date_received,
-                                    payment_method,reference,airbnb_booking_ref,notes)
-                                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                                (r_yr, r_mo, entry["guest"], entry["income_type"],
-                                 entry["amount"], entry["checkin"],
-                                 entry["payment_method"], entry["reference"], "", entry["notes"])
-                            )
-                            conn.commit()
-                            saved += 1
-                        except Exception as e:
-                            errors.append(f"{entry['guest']}: {e}")
-                    conn.close()
-                    if errors:
-                        for err in errors: st.error(f"❌ {err}")
-                    else:
-                        st.success(f"✓ {saved} entries saved to Direct Income register (Tab 10).")
-                        for k in ["ab_reconcile_result","ab_reconcile_year",
-                                  "ab_reconcile_month","ab_csv_bytes","ab_csv_name"]:
-                            st.session_state.pop(k, None)
-                        st.rerun()
-
-                if st.button("🗑️ Discard", key="btn_ab_discard"):
-                    for k in ["ab_reconcile_result","ab_reconcile_year",
-                              "ab_reconcile_month","ab_csv_bytes","ab_csv_name"]:
-                        st.session_state.pop(k, None)
-                    st.rerun()
-            else:
-                st.success("✅ All bookings matched — no Direct/Extras this month.")
-                if st.button("✅ Done", key="btn_ab_done"):
-                    for k in ["ab_reconcile_result","ab_reconcile_year",
-                              "ab_reconcile_month","ab_csv_bytes","ab_csv_name"]:
-                        st.session_state.pop(k, None)
-                    st.rerun()
-
-    # ── SUB-TAB C: PERSONAL RECEIPTS (OWNER) ───────────────────────────────────
-    with scan_subtab3:
         st.markdown("**Scan your personal one-off receipts** — AI reads them automatically. Enter ULU's allocated share.")
 
         ym_list2 = get_year_month_list()
@@ -1879,7 +1686,7 @@ with tab3:
     c1,c2,c3,c4 = st.columns(4)
     c1.markdown(f'<div class="metric-box"><div class="metric-label">Gross Income</div><div class="metric-value">RM {summary["gross_income"]:,.0f}</div></div>', unsafe_allow_html=True)
     c2.markdown(f'<div class="metric-box mid"><div class="metric-label">Gross Op Cost</div><div class="metric-value">RM {summary["gross_op_cost"]:,.0f}</div></div>', unsafe_allow_html=True)
-    c3.markdown(f'<div class="metric-box mid"><div class="metric-label">Co-Host ({summary["cohost_pct"]:.0f}%)</div><div class="metric-value">RM {summary["cohost_share"]:,.0f}</div></div>', unsafe_allow_html=True)
+    c3.markdown(f'<div class="metric-box mid"><div class="metric-label">Management Fee ({summary["cohost_pct"]:.0f}%)</div><div class="metric-value">RM {summary["cohost_share"]:,.0f}</div></div>', unsafe_allow_html=True)
     c4.markdown(f'<div class="metric-box accent"><div class="metric-label">Your Net Profit</div><div class="metric-value">RM {summary["owner_share"]:,.0f}</div></div>', unsafe_allow_html=True)
 
     st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
@@ -1896,7 +1703,7 @@ with tab3:
                 "  Personal Expenses (ULU Share)",
                 "Gross Operating Cost",
                 "Net Profit Before Sharing",
-                f"  Co-Host Share ({summary['cohost_pct']:.0f}%)",
+                f"  Management Fee ({summary['cohost_pct']:.0f}%)",
                 "Owner Net Profit"
             ],
             "Amount (RM)": [
@@ -1988,32 +1795,21 @@ with tab4:
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.markdown('<p class="card-title">📊 All-Time Performance Summary</p>', unsafe_allow_html=True)
 
-    # Compute all-time figures across all years — cached since this is 7 round trips
-    # and previously ran fresh on every single rerun regardless of which tab was open.
-    @st.cache_data(ttl=60)
-    def _get_alltime_booking_figures():
-        conn = get_db()
-        vals = {
-            "gross":    conn.execute("SELECT COALESCE(SUM(amount),0) as t FROM bookings").fetchone()["t"],
-            "mgr":      conn.execute("SELECT COALESCE(SUM(amount),0) as t FROM manager_expenses").fetchone()["t"],
-            "personal": conn.execute("SELECT COALESCE(SUM(ulu_share),0) as t FROM personal_expenses").fetchone()["t"],
-            "nights":   conn.execute("SELECT COALESCE(SUM(nights),0) as t FROM bookings").fetchone()["t"],
-            "bookings": conn.execute("SELECT COUNT(*) as t FROM bookings").fetchone()["t"],
-            "whole":    conn.execute("SELECT COUNT(*) as t FROM bookings WHERE room_type='WHOLE'").fetchone()["t"],
-            "mbed":     conn.execute("SELECT COUNT(*) as t FROM bookings WHERE room_type='MBED'").fetchone()["t"],
-        }
-        conn.close()
-        return vals
-
-    _at = _get_alltime_booking_figures()
-    at_gross, at_mgr, at_personal = _at["gross"], _at["mgr"], _at["personal"]
-    at_nights, at_bookings = _at["nights"], _at["bookings"]
-    at_whole, at_mbed = _at["whole"], _at["mbed"]
+    # Compute all-time figures across all years
+    conn = get_db()
+    at_gross   = conn.execute("SELECT COALESCE(SUM(amount),0) as t FROM bookings").fetchone()["t"]
+    at_mgr     = conn.execute("SELECT COALESCE(SUM(amount),0) as t FROM manager_expenses").fetchone()["t"]
+    at_personal= conn.execute("SELECT COALESCE(SUM(ulu_share),0) as t FROM personal_expenses").fetchone()["t"]
+    at_nights  = conn.execute("SELECT COALESCE(SUM(nights),0) as t FROM bookings").fetchone()["t"]
+    at_bookings= conn.execute("SELECT COUNT(*) as t FROM bookings").fetchone()["t"]
+    at_whole   = conn.execute("SELECT COUNT(*) as t FROM bookings WHERE room_type='WHOLE'").fetchone()["t"]
+    at_mbed    = conn.execute("SELECT COUNT(*) as t FROM bookings WHERE room_type='MBED'").fetchone()["t"]
     # Months in operation
     start_y = int(get_setting("operation_start_year") or 2024)
     start_m = int(get_setting("operation_start_month") or 7)
     now = datetime.datetime.now()
     months_ops = (now.year - start_y) * 12 + (now.month - start_m) + 1
+    conn.close()
 
     at_opex        = at_mgr + at_personal
     at_net_before  = at_gross - at_opex
@@ -2028,7 +1824,7 @@ with tab4:
     r1c1, r1c2, r1c3, r1c4 = st.columns(4)
     r1c1.markdown(f'<div class="metric-box"><div class="metric-label">Total Gross Income</div><div class="metric-value">RM {at_gross:,.0f}</div></div>', unsafe_allow_html=True)
     r1c2.markdown(f'<div class="metric-box mid"><div class="metric-label">Total OpEx Paid</div><div class="metric-value">RM {at_opex:,.0f}</div></div>', unsafe_allow_html=True)
-    r1c3.markdown(f'<div class="metric-box mid"><div class="metric-label">Co-Host Paid (Azary)</div><div class="metric-value">RM {at_cohost:,.0f}</div></div>', unsafe_allow_html=True)
+    r1c3.markdown(f'<div class="metric-box mid"><div class="metric-label">Paid to Archmedia Sdn Bhd</div><div class="metric-value">RM {at_cohost:,.0f}</div></div>', unsafe_allow_html=True)
     r1c4.markdown(f'<div class="metric-box accent"><div class="metric-label">Your Net Profit</div><div class="metric-value">RM {at_owner:,.0f}</div></div>', unsafe_allow_html=True)
 
     st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
@@ -2059,7 +1855,7 @@ with tab4:
             <span>·</span>
             <span><b>Master Bed:</b> {at_mbed} bookings ({at_mbed/at_bookings*100:.0f}%)</span>
             <span>·</span>
-            <span><b>Co-Host Rate:</b> {cohost_pct_setting:.0f}%</span>
+            <span><b>Management Fee Rate:</b> {cohost_pct_setting:.0f}%</span>
         </div>
         """, unsafe_allow_html=True)
 
@@ -2101,7 +1897,7 @@ with tab4:
             "Gross Income": f"{v['gross_income']:,.2f}",
             "Op Cost": f"{v['gross_op_cost']:,.2f}",
             "Net Before Share": f"{v['net_before_sharing']:,.2f}",
-            "Co-Host": f"{v['cohost_share']:,.2f}",
+            "Management Fee": f"{v['cohost_share']:,.2f}",
             "Owner Net": f"{v['owner_share']:,.2f}",
             "Net %": f"{nett_pct:.1f}%",
         })
@@ -2139,7 +1935,7 @@ with tab4:
         ce.metric("Total Nights", total_nights)
 
         avg_per_night = yearly_income / total_nights if total_nights else 0
-        st.markdown(f"<span style='color:#1C1C1A;font-size:1rem'>Average rate per night: <b>{fmt_myr(avg_per_night)}</b></span>", unsafe_allow_html=True)
+        st.caption(f"Average rate per night: {fmt_myr(avg_per_night)}")
 
         st.markdown("---")
         st.markdown("**Room Type Breakdown — Bookings, Nights & Revenue**")
@@ -2202,7 +1998,7 @@ with tab4:
         })
     if roi_rows:
         st.dataframe(pd.DataFrame(roi_rows), use_container_width=True, hide_index=True)
-        st.markdown(f"<span style='color:#1C1C1A;font-size:1rem'>Investment cost: <b>{fmt_myr(inv_cost)}</b></span>", unsafe_allow_html=True)
+        st.caption(f"Investment cost: {fmt_myr(inv_cost)}")
     st.markdown('</div>', unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════
@@ -2357,53 +2153,31 @@ Return ONLY the JSON."""
             if not cx_desc.strip() or cx_amount <= 0:
                 st.error("Description and amount are required.")
             else:
-                receipt_path   = ""
-                file_name_save = ""
-
+                # Save scan file if uploaded
+                scan_path = ""
                 if st.session_state.get("capex_bytes"):
-                    vendor_clean   = (cx_vendor or "Unknown").replace("/","_")[:20]
-                    file_name_save = f"{cx_date}_{vendor_clean}_{st.session_state.get('capex_name','receipt')}"
-
-                    # Detect if running locally (not on Streamlit Cloud)
-                    is_cloud = os.environ.get("STREAMLIT_SHARING_MODE") or \
-                               os.environ.get("HOME","").startswith("/home/appuser") or \
-                               "/mount/src" in os.path.abspath(__file__)
-
-                    if not is_cloud:
-                        # Local — save to CapEx Receipts folder
-                        scan_folder = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                                   "CapEx Receipts")
-                        os.makedirs(scan_folder, exist_ok=True)
-                        receipt_path = os.path.join(scan_folder, file_name_save)
-                        with open(receipt_path, "wb") as _f:
-                            _f.write(st.session_state["capex_bytes"])
-                    else:
-                        # Cloud — store filename only, no local disk
-                        receipt_path = file_name_save
+                    scan_folder = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                               "CapEx Receipts")
+                    os.makedirs(scan_folder, exist_ok=True)
+                    vendor_clean = (cx_vendor or "Unknown").replace("/","_")[:20]
+                    fname_save   = f"{cx_date}_{vendor_clean}_{st.session_state.get('capex_name','receipt')}"
+                    scan_path    = os.path.join(scan_folder, fname_save)
+                    with open(scan_path, "wb") as _f:
+                        _f.write(st.session_state["capex_bytes"])
 
                 conn = get_db()
-                db_error = None
-                try:
-                    conn.execute("""INSERT INTO capex_items
-                        (purchase_date,vendor,description,category,amount,useful_life_years,file_name,receipt_path,notes)
-                        VALUES (?,?,?,?,?,?,?,?,?)""",
-                        (cx_date, cx_vendor, cx_desc.strip(), cx_cat,
-                         cx_amount, cx_life, file_name_save, receipt_path, cx_notes))
-                    conn.commit()
-                except Exception as e:
-                    db_error = str(e)
-                finally:
-                    conn.close()
-
-                if db_error:
-                    st.error(f"❌ Save failed — database error: {db_error}")
-                    st.info("Tip: Check Supabase dashboard → capex_items table to confirm columns exist.")
-                else:
-                    for k in ["capex_bytes","capex_name","capex_vendor","capex_desc",
-                              "capex_amount","capex_date","capex_cat","capex_upload_name"]:
-                        st.session_state.pop(k, None)
-                    st.success("✓ CapEx item saved.")
-                    st.rerun()
+                conn.execute("""INSERT INTO capex_items
+                    (purchase_date,vendor,description,category,amount,useful_life_years,scan_path,notes)
+                    VALUES (?,?,?,?,?,?,?,?)""",
+                    (cx_date, cx_vendor, cx_desc.strip(), cx_cat,
+                     cx_amount, cx_life, scan_path, cx_notes))
+                conn.commit(); conn.close()
+                # Clear session state
+                for k in ["capex_bytes","capex_name","capex_vendor","capex_desc",
+                          "capex_amount","capex_date","capex_cat"]:
+                    st.session_state.pop(k, None)
+                st.success("✓ CapEx item saved.")
+                st.rerun()
 
     with capex_view:
         conn = get_db()
@@ -2428,25 +2202,23 @@ Return ONLY the JSON."""
             st.dataframe(pd.DataFrame(cat_rows), use_container_width=True, hide_index=True)
             st.divider()
 
-            # Full list with delete
+            # Full list with delete and scan download
             st.subheader("All CapEx Items")
             for r in [dict(r) for r in capex_rows]:
                 rc1,rc2,rc3,rc4,rc5,rc6 = st.columns([2,3,2,2,1,1])
-                rc1.markdown(f"<span style='color:#1C1C1A;font-size:0.9rem'>{r.get('purchase_date','')}</span>", unsafe_allow_html=True)
-                rc2.markdown(f"<span style='color:#1C1C1A;font-size:0.9rem'>{(r.get('description','') or '')[:40]}</span>", unsafe_allow_html=True)
-                rc3.markdown(f"<span style='color:#1C1C1A;font-size:0.9rem'>{(r.get('category','') or '')[:25]}</span>", unsafe_allow_html=True)
-                rc4.markdown(f"<span style='color:#1C1C1A;font-size:0.9rem;font-weight:600'>{fmt_myr(r.get('amount',0))}</span>", unsafe_allow_html=True)
-                # Receipt file — use file_name or receipt_path
-                sp = r.get("receipt_path","") or r.get("scan_path","") or r.get("file_name","")
-                _file_bytes = cached_read_local_file(sp) if sp else None
-                if _file_bytes:
-                    ext = sp.split(".")[-1].lower()
-                    mime = "application/pdf" if ext=="pdf" else f"image/{ext}"
-                    rc5.download_button("📎", data=_file_bytes,
-                        file_name=os.path.basename(sp), mime=mime,
-                        key=f"cx_dl_{r['id']}")
-                elif sp:
-                    rc5.caption("📎")  # file recorded but not on this machine
+                rc1.caption(r.get("purchase_date",""))
+                rc2.caption(r.get("description","")[:40])
+                rc3.caption(r.get("category","")[:25])
+                rc4.caption(fmt_myr(r.get("amount",0)))
+                # Scan download
+                sp = r.get("scan_path","")
+                if sp and os.path.exists(sp):
+                    with open(sp,"rb") as _f:
+                        ext = sp.split(".")[-1].lower()
+                        mime = "application/pdf" if ext=="pdf" else f"image/{ext}"
+                        rc5.download_button("📎", data=_f.read(),
+                            file_name=os.path.basename(sp), mime=mime,
+                            key=f"cx_dl_{r['id']}")
                 else:
                     rc5.caption("—")
                 if rc6.button("🗑", key=f"cx_del_{r['id']}"):
@@ -2506,9 +2278,9 @@ with tab7:
                 highlight = "background:#fff8e1;padding:8px;border-radius:6px;margin-bottom:6px" if cur_cat == "Uncategorised" else "padding:4px;margin-bottom:4px"
                 st.markdown(f"<div style='{highlight}'>", unsafe_allow_html=True)
                 oc1,oc2,oc3,oc4 = st.columns([2,3,3,1])
-                oc1.markdown(f"<span style='color:#1C1C1A;font-size:1rem'>{MONTHS[r['month']-1]} {r['year']}</span>", unsafe_allow_html=True)
-                oc2.markdown(f"<span style='color:#1C1C1A;font-size:1rem'><b>{r['expense_item']}</b> — {r['vendor'] or ''}</span>", unsafe_allow_html=True)
-                oc3.markdown(f"<span style='color:#1C1C1A;font-size:1rem;font-weight:600'>{fmt_myr(r['amount'])}</span>", unsafe_allow_html=True)
+                oc1.caption(f"{MONTHS[r['month']-1]} {r['year']}")
+                oc2.caption(f"**{r['expense_item']}** — {r['vendor'] or ''}")
+                oc3.caption(fmt_myr(r["amount"]))
                 new_cat = oc4.selectbox("Category", OPEX_CATEGORIES,
                     index=cat_idx, key=f"opex_cat_{r['id']}",
                     label_visibility="collapsed")
@@ -2545,10 +2317,10 @@ with tab7:
                 pe_highlight = "padding:4px;margin-bottom:4px"
                 st.markdown(f"<div style='{pe_highlight}'>", unsafe_allow_html=True)
                 pc1, pc2, pc3, pc4, pc5, pc6 = st.columns([1.5, 2.5, 2, 2, 1.5, 0.5])
-                pc1.markdown(f"<span style='color:#1C1C1A;font-size:1rem'>{MONTHS[r['month']-1]} {r['year']}</span>", unsafe_allow_html=True)
-                pc2.markdown(f"<span style='color:#1C1C1A;font-size:1rem'><b>{r['vendor']}</b></span>", unsafe_allow_html=True)
-                pc3.markdown(f"<span style='color:#1C1C1A;font-size:0.9rem'>{r['description'][:35] if r['description'] else ''}</span>", unsafe_allow_html=True)
-                pc4.markdown(f"<span style='color:#1C1C1A;font-size:1rem;font-weight:600'>{fmt_myr(r['ulu_share'])}</span>", unsafe_allow_html=True)
+                pc1.caption(f"{MONTHS[r['month']-1]} {r['year']}")
+                pc2.caption(f"**{r['vendor']}**")
+                pc3.caption(r["description"][:35] if r["description"] else "")
+                pc4.caption(fmt_myr(r["ulu_share"]))
                 # Category edit
                 cur_pe_cat = r.get("category") or "Miscellaneous"
                 pe_cat_idx = EXPENSE_CATEGORIES.index(cur_pe_cat) if cur_pe_cat in EXPENSE_CATEGORIES else 0
@@ -2705,7 +2477,7 @@ with tab8:
         dc1, dc2 = st.columns(2)
         with dc1:
             st.markdown("#### 📊 Excel Workbook")
-            st.caption("Income Ledger · OpEx Breakdown · CapEx Schedule · P&L Summary · ROI")
+            st.caption("Income Ledger · OpEx Breakdown · CapEx Schedule · P&L Summary · Payments & Vouchers")
             if st.button("Generate Excel", type="primary", key="gen_ulu_excel"):
                 with st.spinner("Building workbook..."):
                     try:
@@ -2722,7 +2494,7 @@ with tab8:
                         ws0["A2"] = f"Period: {exp_period} {exp_year}"
                         ws0["A3"] = f"Generated: {datetime.datetime.now().strftime('%d %b %Y %H:%M')}"
                         ws0["A5"] = "Contents:"
-                        for i,s in enumerate(["Income Ledger","OpEx Breakdown","CapEx Schedule","P&L Summary"],1):
+                        for i,s in enumerate(["Income Ledger","OpEx Breakdown","CapEx Schedule","P&L Summary","Payments & Vouchers"],1):
                             ws0[f"A{5+i}"] = f"  {i}. {s}"
 
                         # -- Income Ledger --
@@ -2790,7 +2562,7 @@ with tab8:
                             ("Gross Rental Income", inc_rows),
                             ("Less: Operating Expenses", -opex_rows),
                             ("Net Before Profit Sharing", net_before),
-                            (f"Co-Host Share ({int(cohost_pct*100)}%)", -cohost_share),
+                            (f"Management Fee ({int(cohost_pct*100)}%)", -cohost_share),
                             ("Owner Net Profit", owner_net),
                             ("",""),
                             ("CapEx This Year (not in P&L)", capex_rows_sum),
@@ -2804,6 +2576,34 @@ with tab8:
                                 if label in ("Owner Net Profit","Gross Rental Income"):
                                     ws4.cell(ri,1).font=Font(bold=True)
                                     ws4.cell(ri,2).font=Font(bold=True)
+
+                        # -- Payments & Vouchers --
+                        ws5 = wb.create_sheet("Payments & Vouchers")
+                        hdrs5 = ["Payment Date","Payee Type","Payee Name","Category","Description",
+                                  "Amount Due (MYR)","Amount Paid (MYR)","Balance (MYR)","Status",
+                                  "Payment Method","Reference No.","Receipt Attached","Proof of Payment Attached","Notes"]
+                        for ci,h in enumerate(hdrs5,1):
+                            c = ws5.cell(1,ci,h); c.font=Font(bold=True,color="FFFFFF")
+                            c.fill=PatternFill("solid",fgColor="2a3528")
+                        conn2 = get_db()
+                        pay_all = conn2.execute(
+                            f"SELECT * FROM payments WHERE CAST(substr(payment_date,1,4) AS INTEGER)=? "
+                            f"AND CAST(substr(payment_date,6,2) AS INTEGER) IN ({ph}) ORDER BY payment_date",
+                            [exp_year]+period_mos
+                        ).fetchall()
+                        conn2.close()
+                        for ri,r in enumerate(pay_all,2):
+                            due  = float(r["amount_due"] or 0)
+                            paid = float(r["amount_paid"] or 0)
+                            vals5 = [r["payment_date"], r["payee_type"], r["payee_name"], r["category"],
+                                     r["description"], due, paid, due-paid, r["status"], r["payment_method"],
+                                     r["reference_no"], "Yes" if r["receipt_path"] else "No",
+                                     "Yes" if r["proof_of_payment_path"] else "No", r["notes"]]
+                            for ci,v in enumerate(vals5,1):
+                                ws5.cell(ri,ci,v)
+                        ws5.cell(len(pay_all)+2,1,"TOTAL").font=Font(bold=True)
+                        ws5.cell(len(pay_all)+2,6,sum(float(r["amount_due"] or 0) for r in pay_all)).font=Font(bold=True)
+                        ws5.cell(len(pay_all)+2,7,sum(float(r["amount_paid"] or 0) for r in pay_all)).font=Font(bold=True)
 
                         conn.close()
                         # Save
@@ -2891,7 +2691,7 @@ with tab8:
                             ["Gross Rental Income", f"{inc_rows:,.2f}"],
                             ["  Manager Expenses", f"({opex_rows:,.2f})"],
                             ["  Net Before Sharing", f"{net_before:,.2f}"],
-                            [f"  Co-Host Share ({int(cohost_pct*100)}%)", f"({cohost_share:,.2f})"],
+                            [f"  Management Fee ({int(cohost_pct*100)}%)", f"({cohost_share:,.2f})"],
                             ["Owner Net Profit", f"{owner_net:,.2f}"],
                             ["", ""],
                             ["CapEx This Year (memo only)", f"{capex_rows_sum:,.2f}"],
@@ -3062,25 +2862,18 @@ with tab8:
                 "📋 Manager Monthly Reports": "Manager Monthly Reports",
                 "📋 CapEx Receipts": "CapEx Receipts",
                 "📊 Accountant Reports": "ULU Accountant Reports",
-                "💳 Payment Vouchers & Attachments": ACCOUNTING_FOLDER_ROOT,
             }
-            @st.cache_data(ttl=60, show_spinner=False)
-            def _count_folder_files(fpath):
-                if not os.path.exists(fpath):
-                    return None
-                return sum(len(files) for _, _, files in os.walk(fpath))
-
             for label, folder in folders.items():
                 fpath = os.path.join(base_dir, folder)
-                file_count = _count_folder_files(fpath)
-                if file_count is not None:
+                if os.path.exists(fpath):
+                    file_count = sum(len(files) for _, _, files in os.walk(fpath))
                     st.write(f"{label} — {file_count} file(s)")
                 else:
                     st.write(f"{label} — folder not yet created")
 
     with acct_tab2:
         st.subheader("Share Access with Accountant / Tax Agent")
-        share1, share2 = st.tabs(["☁️ OneDrive Links", "📋 What to Share"])
+        share1, share2, share3 = st.tabs(["☁️ OneDrive Links", "💳 Payment Vouchers", "📋 What to Share"])
 
         with share1:
             st.caption("Paste your OneDrive sharing links below to generate a WhatsApp message.")
@@ -3090,15 +2883,12 @@ with tab8:
                 placeholder="Right-click folder → Share → Copy link")
             od_reports = st.text_input("📊 ULU Accountant Reports folder link", key="od_ulu_rpt",
                 placeholder="Right-click folder → Share → Copy link")
-            od_vouchers = st.text_input("💳 Payment Vouchers & Attachments folder link", key="od_ulu_vouchers",
-                placeholder="Right-click folder → Share → Copy link")
 
             if st.button("📱 Generate WhatsApp Message", key="gen_ulu_wa"):
                 links = ""
-                if od_reports:  links += f"📊 *Financial Reports (Excel):*\n{od_reports}\n\n"
-                if od_mgr:      links += f"📋 *Manager Monthly Reports (Azary's Submissions):*\n{od_mgr}\n\n"
-                if od_capex:    links += f"📋 *CapEx Receipts & Invoices:*\n{od_capex}\n\n"
-                if od_vouchers: links += f"💳 *Payment Vouchers & Attachments (Claim Invoices + Proof of Payment):*\n{od_vouchers}\n\n"
+                if od_reports: links += f"📊 *Financial Reports (Excel):*\n{od_reports}\n\n"
+                if od_mgr:     links += f"📋 *Manager Monthly Reports (Property Manager's Submissions):*\n{od_mgr}\n\n"
+                if od_capex:   links += f"📋 *CapEx Receipts & Invoices:*\n{od_capex}\n\n"
                 if not links:
                     st.warning("Please paste at least one link.")
                 else:
@@ -3115,15 +2905,66 @@ with tab8:
                     st.success("✓ Message ready. Copy and send via WhatsApp.")
 
         with share2:
+            st.caption("Payment records and their receipt / proof-of-payment attachments live in secure "
+                       "cloud storage, not OneDrive. This tab lets you access every payment record directly "
+                       "in the app (same login as everything else), or send a summary with signed download "
+                       "links to a specific accountant / tax agent.")
+
+            st.markdown("**Full access:** everything recorded in the *Payments & Vouchers* tab — every "
+                       "record, status, and attachment — is already visible to anyone with access to this app, "
+                       "no extra sharing step needed.")
+            st.divider()
+
+            st.markdown("**Or send a summary for a specific period:**")
+            sp1, sp2 = st.columns(2)
+            sh_year  = sp1.selectbox("Year", list(range(datetime.datetime.now().year, 2023, -1)), key="sh_pay_year")
+            sh_status = sp2.multiselect("Status", ["Pending","Partial","Paid"], key="sh_pay_status")
+
+            if st.button("📱 Generate Payment Summary for WhatsApp", key="gen_pay_wa"):
+                conn = get_db()
+                rows = conn.execute(
+                    "SELECT * FROM payments WHERE CAST(substr(payment_date,1,4) AS INTEGER)=? ORDER BY payment_date",
+                    (sh_year,)
+                ).fetchall()
+                conn.close()
+                if sh_status:
+                    rows = [r for r in rows if r["status"] in sh_status]
+
+                if not rows:
+                    st.warning("No payment records found for that year/status.")
+                else:
+                    lines = [f"Hi, here are the payment records for ULU Mahsuri Villa ({sh_year}):", ""]
+                    for r in rows:
+                        due  = float(r["amount_due"] or 0)
+                        paid = float(r["amount_paid"] or 0)
+                        lines.append(f"PV-{r['id']:05d} · {r['payment_date']} · {r['payee_name']} · "
+                                     f"{r['category']} · RM {due:,.2f} ({r['status']})")
+                        if r.get("receipt_path"):
+                            r_url = get_payment_file_url(r["receipt_path"], expires_in=1209600)
+                            if r_url:
+                                lines.append(f"  Receipt: {r_url}")
+                        if r.get("proof_of_payment_path"):
+                            p_url = get_payment_file_url(r["proof_of_payment_path"], expires_in=1209600)
+                            if p_url:
+                                lines.append(f"  Proof of Payment: {p_url}")
+                        lines.append("")
+                    lines.append("All links are view-only and valid for 14 days. Please contact me if you need anything else.")
+                    lines.append("— Azlan")
+
+                    wa_summary = "\n".join(lines)
+                    st.text_area("📱 WhatsApp Message (copy & paste):", value=wa_summary,
+                                 height=300, key="pay_wa_msg")
+                    st.success(f"✓ {len(rows)} record(s) included. Links valid for 14 days from now.")
+
+        with share3:
             st.markdown("""
 **What to prepare for your accountant / tax agent:**
 
 **For Income Tax (LHDN):**
 - ✅ Excel Workbook (Income Ledger + P&L Summary)
-- ✅ Manager Monthly Reports (Azary's original billing submissions)
+- ✅ Manager Monthly Reports (Property Manager's original billing submissions)
 - ✅ Airbnb statements for the year
 - ✅ CapEx Schedule (for depreciation claims)
-- ✅ Payment Vouchers + Claim Invoices + Proof of Payment (all vendor/management fee payments)
 
 **For RPGT (if property sold):**
 - ✅ CapEx receipts (all upgrade costs increase your cost base)
@@ -3135,11 +2976,317 @@ with tab8:
 - CapEx receipts must be kept as evidence for 7 years
 
 **What the accountant needs each year:**
-1. Generate Excel report from this tab
+1. Generate Excel report from this tab (now includes a Payments & Vouchers sheet)
 2. Share CapEx Receipts folder (all original invoices)
 3. Share ULU Accountant Reports folder
-4. Share Payment Vouchers & Attachments folder (Accounting Folder - Payment Vouchers)
+4. Give access to the Payments & Vouchers tab, or send a payment summary from the "💳 Payment Vouchers" tab above, for full visibility on management fee and reimbursement payments
 """)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════════
+# TAB 9 — PAYMENTS & VOUCHERS
+# ══════════════════════════════════════════════
+with tab9:
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown('<p class="card-title">💳 Payments & Vouchers</p>', unsafe_allow_html=True)
+    st.caption("Record payments to the Property Manager, Archmedia Sdn Bhd (management fee), "
+               "and Suppliers/Vendors, with receipt + proof-of-payment attachments and printable vouchers. "
+               "Every record here is visible to whoever has access to this app, including the Accountant.")
+
+    pay_tab1, pay_tab2, pay_tab3 = st.tabs(
+        ["➕ Record Payment", "📋 All Payment Records", "🧾 Generate Voucher PDF"]
+    )
+
+    PAYEE_TYPES = ["Property Manager (Reimbursable)", "Archmedia Sdn Bhd (Management Fee)", "Vendor / Supplier (Direct Expense)"]
+    PAYMENT_STATUSES = ["Pending", "Partial", "Paid"]
+    PAYMENT_METHODS = ["Bank Transfer", "Cash", "Cheque", "DuitNow", "Other"]
+
+    # ── SUB-TAB 1: RECORD PAYMENT ──────────────────────────────────────
+    with pay_tab1:
+        st.subheader("Record a New Payment")
+
+        link_existing = st.checkbox("Link to an existing expense record", key="pay_link_existing")
+
+        linked_source_table = ""
+        linked_source_id = None
+        prefill_payee = ""
+        prefill_desc = ""
+        prefill_amount = 0.0
+
+        if link_existing:
+            src_choice = st.radio("Source", ["Manager Expense", "Personal Expense", "CapEx Item"],
+                                   horizontal=True, key="pay_src_choice")
+            conn = get_db()
+            if src_choice == "Manager Expense":
+                rows = conn.execute(
+                    "SELECT * FROM manager_expenses ORDER BY year DESC, month DESC, id DESC LIMIT 200"
+                ).fetchall()
+                options = {f"#{r['id']} · {MONTHS[r['month']-1]} {r['year']} · {r['expense_item']} · {r['vendor']} · RM{float(r['amount'] or 0):,.2f}": r for r in rows}
+            elif src_choice == "Personal Expense":
+                rows = conn.execute(
+                    "SELECT * FROM personal_expenses ORDER BY year DESC, month DESC, id DESC LIMIT 200"
+                ).fetchall()
+                options = {f"#{r['id']} · {MONTHS[r['month']-1]} {r['year']} · {r['vendor']} · {r['category']} · RM{float(r['ulu_share'] or 0):,.2f}": r for r in rows}
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM capex_items ORDER BY purchase_date DESC LIMIT 200"
+                ).fetchall()
+                options = {f"#{r['id']} · {r['purchase_date']} · {r['vendor']} · {r['description']} · RM{float(r['amount'] or 0):,.2f}": r for r in rows}
+            conn.close()
+
+            if options:
+                pick = st.selectbox("Select record", list(options.keys()), key="pay_pick_record")
+                picked = options[pick]
+                linked_source_table = {"Manager Expense":"manager_expenses","Personal Expense":"personal_expenses","CapEx Item":"capex_items"}[src_choice]
+                linked_source_id = picked["id"]
+                if src_choice == "Manager Expense":
+                    prefill_payee  = picked["vendor"] or ""
+                    prefill_desc   = picked["expense_item"] or ""
+                    prefill_amount = float(picked["amount"] or 0)
+                elif src_choice == "Personal Expense":
+                    prefill_payee  = picked["vendor"] or ""
+                    prefill_desc   = picked["description"] or picked["category"] or ""
+                    prefill_amount = float(picked["ulu_share"] or 0)
+                else:
+                    prefill_payee  = picked["vendor"] or ""
+                    prefill_desc   = picked["description"] or ""
+                    prefill_amount = float(picked["amount"] or 0)
+            else:
+                st.info("No records found for this source yet.")
+
+        pc1, pc2, pc3 = st.columns([1.3, 1.5, 1.2])
+        payee_type = pc1.selectbox("Payee Type", PAYEE_TYPES, key="pay_payee_type")
+
+        default_payee_name = prefill_payee
+        default_payee_phone = ""
+        if not default_payee_name:
+            if payee_type.startswith("Property Manager"):
+                default_payee_name = get_setting("property_manager_name") or ""
+                default_payee_phone = get_setting("property_manager_phone") or ""
+            elif payee_type.startswith("Archmedia"):
+                default_payee_name = get_setting("archmedia_company_name") or "Archmedia Sdn Bhd"
+                default_payee_phone = get_setting("archmedia_contact") or ""
+
+        payee_name  = pc2.text_input("Payee Name", value=default_payee_name, key="pay_payee_name")
+        payee_phone = pc3.text_input("WhatsApp No. (optional)", value=default_payee_phone,
+                                      key="pay_payee_phone", placeholder="e.g. 60123456789",
+                                      help="Country code + number, no + or leading 0. Used to send the voucher directly via WhatsApp.")
+
+        default_category = ""
+        if payee_type.startswith("Archmedia"):
+            cohost_pct_disp = float(get_setting("cohost_pct") or 30)
+            default_category = f"Management Fee ({cohost_pct_disp:.0f}%)"
+        elif payee_type.startswith("Property Manager"):
+            default_category = "Reimbursable Expense"
+        else:
+            default_category = "Direct Expense"
+
+        cc1, cc2 = st.columns(2)
+        category = cc1.text_input("Category", value=default_category, key="pay_category")
+        description = cc2.text_input("Description", value=prefill_desc, key="pay_description")
+
+        ac1, ac2, ac3 = st.columns(3)
+        amount_due  = ac1.number_input("Amount Due (RM)", min_value=0.0, value=float(prefill_amount), step=10.0, key="pay_amount_due")
+        status      = ac2.selectbox("Status", PAYMENT_STATUSES, key="pay_status")
+        amount_paid = ac3.number_input("Amount Paid (RM)", min_value=0.0,
+                                        value=float(prefill_amount) if status=="Paid" else 0.0,
+                                        step=10.0, key="pay_amount_paid")
+
+        dc1, dc2, dc3 = st.columns(3)
+        payment_date_val = dc1.date_input("Payment Date", value=datetime.date.today(), key="pay_date")
+        payment_method   = dc2.selectbox("Payment Method", PAYMENT_METHODS, key="pay_method")
+        reference_no     = dc3.text_input("Reference No.", key="pay_reference")
+
+        fc1, fc2 = st.columns(2)
+        receipt_file = fc1.file_uploader("📎 Attach Receipt", type=["jpg","jpeg","png","pdf"], key="pay_receipt_upload")
+        proof_file   = fc2.file_uploader("📎 Attach Proof of Payment", type=["jpg","jpeg","png","pdf"], key="pay_proof_upload")
+
+        notes = st.text_area("Notes", key="pay_notes", height=70)
+
+        if st.button("💾 Save Payment Record", key="pay_save_btn", use_container_width=True):
+            if not payee_name.strip():
+                st.warning("Please enter a payee name.")
+            else:
+                receipt_path = upload_payment_file(receipt_file.read(), receipt_file.name, "receipt") if receipt_file else None
+                proof_path   = upload_payment_file(proof_file.read(), proof_file.name, "proof") if proof_file else None
+
+                conn = get_db()
+                conn.execute(
+                    """INSERT INTO payments
+                       (payment_date,payee_type,payee_name,payee_phone,category,source_table,source_id,description,
+                        amount_due,amount_paid,status,payment_method,reference_no,receipt_path,proof_of_payment_path,notes)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (str(payment_date_val), payee_type, payee_name, payee_phone, category, linked_source_table, linked_source_id,
+                     description, amount_due, amount_paid, status, payment_method, reference_no,
+                     receipt_path, proof_path, notes)
+                )
+                conn.commit(); conn.close()
+                st.success("✅ Payment record saved.")
+                st.rerun()
+
+    # ── SUB-TAB 2: ALL PAYMENT RECORDS ─────────────────────────────────
+    with pay_tab2:
+        st.subheader("All Payment Records")
+
+        conn = get_db()
+        all_payments = conn.execute("SELECT * FROM payments ORDER BY payment_date DESC, id DESC").fetchall()
+        conn.close()
+
+        if not all_payments:
+            st.info("No payment records yet. Add one in the 'Record Payment' tab.")
+        else:
+            fcol1, fcol2 = st.columns(2)
+            f_type   = fcol1.multiselect("Filter by Payee Type", PAYEE_TYPES, key="pay_filter_type")
+            f_status = fcol2.multiselect("Filter by Status", PAYMENT_STATUSES, key="pay_filter_status")
+
+            filtered = [p for p in all_payments
+                        if (not f_type or p["payee_type"] in f_type)
+                        and (not f_status or p["status"] in f_status)]
+
+            tot_due  = sum(float(p["amount_due"] or 0) for p in filtered)
+            tot_paid = sum(float(p["amount_paid"] or 0) for p in filtered)
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Total Due", fmt_myr(tot_due))
+            m2.metric("Total Paid", fmt_myr(tot_paid))
+            m3.metric("Outstanding", fmt_myr(tot_due - tot_paid))
+            st.divider()
+
+            status_icon = {"Paid":"🟢","Partial":"🟡","Pending":"🔴"}
+
+            for p in filtered:
+                header = (f"{status_icon.get(p['status'],'⚪')} #{p['id']} · {p['payment_date']} · "
+                          f"{p['payee_name']} · {p['category']} · RM {float(p['amount_due'] or 0):,.2f} ({p['status']})")
+                with st.expander(header):
+                    e1, e2 = st.columns(2)
+                    e1.write(f"**Payee Type:** {p['payee_type']}")
+                    e1.write(f"**Description:** {p.get('description') or '—'}")
+                    e1.write(f"**Payment Method:** {p.get('payment_method') or '—'}")
+                    e1.write(f"**Reference No.:** {p.get('reference_no') or '—'}")
+                    e2.write(f"**Amount Due:** {fmt_myr(float(p['amount_due'] or 0))}")
+                    e2.write(f"**Amount Paid:** {fmt_myr(float(p['amount_paid'] or 0))}")
+                    e2.write(f"**Balance:** {fmt_myr(float(p['amount_due'] or 0) - float(p['amount_paid'] or 0))}")
+                    if p.get("notes"):
+                        st.caption(f"Notes: {p['notes']}")
+
+                    lcol1, lcol2 = st.columns(2)
+                    if p.get("receipt_path"):
+                        rurl = get_payment_file_url(p["receipt_path"])
+                        if rurl:
+                            lcol1.markdown(f"[📄 View Receipt]({rurl})")
+                    else:
+                        lcol1.caption("No receipt attached")
+                    if p.get("proof_of_payment_path"):
+                        purl = get_payment_file_url(p["proof_of_payment_path"])
+                        if purl:
+                            lcol2.markdown(f"[📄 View Proof of Payment]({purl})")
+                    else:
+                        lcol2.caption("No proof of payment attached")
+
+                    st.markdown("---")
+                    uc1, uc2, uc3 = st.columns(3)
+                    new_status = uc1.selectbox("Update Status", PAYMENT_STATUSES,
+                                                index=PAYMENT_STATUSES.index(p["status"]) if p["status"] in PAYMENT_STATUSES else 0,
+                                                key=f"upd_status_{p['id']}")
+                    new_paid = uc2.number_input("Update Amount Paid (RM)", min_value=0.0,
+                                                 value=float(p["amount_paid"] or 0), step=10.0,
+                                                 key=f"upd_paid_{p['id']}")
+                    if uc3.button("Update", key=f"upd_btn_{p['id']}"):
+                        conn = get_db()
+                        conn.execute("UPDATE payments SET status=?, amount_paid=? WHERE id=?",
+                                     (new_status, new_paid, p["id"]))
+                        conn.commit(); conn.close()
+                        st.success("Updated.")
+                        st.rerun()
+
+                    if st.button("🗑️ Delete Record", key=f"del_pay_{p['id']}"):
+                        conn = get_db()
+                        conn.execute("DELETE FROM payments WHERE id=?", (p["id"],))
+                        conn.commit(); conn.close()
+                        st.success("Deleted.")
+                        st.rerun()
+
+    # ── SUB-TAB 3: GENERATE VOUCHER PDF ────────────────────────────────
+    with pay_tab3:
+        st.subheader("Generate Payment Voucher PDF")
+
+        conn = get_db()
+        voucher_rows = conn.execute("SELECT * FROM payments ORDER BY payment_date DESC, id DESC").fetchall()
+        conn.close()
+
+        if not voucher_rows:
+            st.info("No payment records yet. Add one in the 'Record Payment' tab.")
+        else:
+            v_options = {f"#{p['id']} · {p['payment_date']} · {p['payee_name']} · RM {float(p['amount_due'] or 0):,.2f} ({p['status']})": p
+                         for p in voucher_rows}
+            v_pick = st.selectbox("Select payment record", list(v_options.keys()), key="voucher_pick")
+            v_row = v_options[v_pick]
+
+            st.write(f"**Payee:** {v_row['payee_name']}  |  **Category:** {v_row['category']}  |  **Status:** {v_row['status']}")
+
+            if st.button("🧾 Generate Voucher", key="gen_voucher_btn"):
+                st.session_state[f"voucher_pdf_{v_row['id']}"] = generate_payment_voucher_pdf(v_row)
+                st.session_state.pop(f"voucher_link_{v_row['id']}", None)  # any old link is now stale
+
+            pdf_bytes = st.session_state.get(f"voucher_pdf_{v_row['id']}")
+
+            if not pdf_bytes:
+                st.caption("Click 'Generate Voucher' to create the PDF.")
+            else:
+                st.download_button(
+                    "⬇️ Download Payment Voucher PDF",
+                    data=pdf_bytes,
+                    file_name=f"Payment_Voucher_PV-{v_row['id']:05d}.pdf",
+                    mime="application/pdf",
+                    key="dl_voucher_btn"
+                )
+
+                st.divider()
+                st.markdown("**📲 Share with Payee via WhatsApp**")
+                st.caption("Uploads the voucher to secure storage and creates a 14-day download link "
+                           "(plus links to any attached receipt / proof of payment), ready to send on WhatsApp.")
+
+                if st.button("🔗 Create Shareable Link", key="create_voucher_link_btn"):
+                    voucher_path = upload_payment_file(pdf_bytes, f"PV-{v_row['id']:05d}.pdf", "voucher")
+                    if voucher_path:
+                        st.session_state[f"voucher_link_{v_row['id']}"] = get_payment_file_url(voucher_path, expires_in=1209600)  # 14 days
+                        st.success("Link created — valid for 14 days.")
+
+                voucher_url = st.session_state.get(f"voucher_link_{v_row['id']}")
+
+                if voucher_url:
+                    msg_lines = [
+                        f"Hi {v_row['payee_name']}, here's your payment voucher from ULU Mahsuri Villa.",
+                        "",
+                        f"Voucher No.: PV-{v_row['id']:05d}",
+                        f"Category: {v_row['category']}",
+                        f"Amount Due: RM {float(v_row['amount_due'] or 0):,.2f}",
+                        f"Amount Paid: RM {float(v_row['amount_paid'] or 0):,.2f}",
+                        f"Status: {v_row['status']}",
+                        "",
+                        f"Download voucher (link valid 14 days): {voucher_url}",
+                    ]
+                    if v_row.get("receipt_path"):
+                        r_url = get_payment_file_url(v_row["receipt_path"])
+                        if r_url:
+                            msg_lines.append(f"Receipt: {r_url}")
+                    if v_row.get("proof_of_payment_path"):
+                        p_url = get_payment_file_url(v_row["proof_of_payment_path"])
+                        if p_url:
+                            msg_lines.append(f"Proof of Payment: {p_url}")
+                    msg_lines += ["", "Thank you."]
+
+                    wa_message = "\n".join(msg_lines)
+                    encoded_msg = urllib.parse.quote(wa_message)
+
+                    phone = (v_row.get("payee_phone") or "").strip().lstrip("+").replace(" ", "").replace("-", "")
+                    wa_url = f"https://wa.me/{phone}?text={encoded_msg}" if phone else f"https://wa.me/?text={encoded_msg}"
+
+                    st.link_button("📲 Open in WhatsApp", wa_url, use_container_width=True)
+                    if not phone:
+                        st.caption("No WhatsApp number saved for this payee — you'll pick the contact inside WhatsApp.")
+                    st.text_area("Or copy this message manually:", value=wa_message, height=220,
+                                 key=f"wa_msg_{v_row['id']}")
     st.markdown('</div>', unsafe_allow_html=True)
 
 
@@ -3206,1159 +3353,3 @@ if import_mode == "true":
         st.success(f"✅ Imported {imported} personal expense entries!")
 
     st.warning("⚠️ Only import once! Importing again will create duplicate entries.")
-
-# ══════════════════════════════════════════════
-# ══════════════════════════════════════════════
-# TAB 9 — PAYMENTS & VOUCHERS
-# ══════════════════════════════════════════════
-PAYMENT_STATUSES = ["Pending", "Paid", "Partial", "Cancelled"]
-PAYMENT_TYPES    = [
-    "Property Manager Reimbursable",
-    "Property Management Fee (Archmedia Sdn Bhd)",
-    "Supplier / Vendor Payment",
-    "Utility Bill",
-    "Housekeeping & Laundry",
-    "Pool Maintenance",
-    "Maintenance & Repairs",
-    "Contractor Payment",
-    "Other",
-]
-STATUS_ICONS = {"Pending":"🟡","Paid":"🟢","Partial":"🔵","Cancelled":"⚫"}
-
-def generate_payment_voucher_pdf(payment: dict) -> bytes:
-    buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf,pagesize=A4,rightMargin=20*mm,leftMargin=20*mm,topMargin=18*mm,bottomMargin=18*mm)
-    INK=colors.HexColor("#1C1C1A"); GREEN=colors.HexColor("#2a3528"); LIGHT=colors.HexColor("#E5DDD0"); RED=colors.HexColor("#CC0000")
-    W=A4[0]-40*mm
-    sN =ParagraphStyle("n", fontName="Helvetica",     fontSize=10,leading=14,textColor=INK)
-    sB =ParagraphStyle("b", fontName="Helvetica-Bold",fontSize=10,leading=14,textColor=INK)
-    sS =ParagraphStyle("s", fontName="Helvetica",     fontSize=8, leading=11,textColor=colors.HexColor("#6B6560"))
-    sT =ParagraphStyle("t", fontName="Helvetica-Bold",fontSize=18,leading=22,textColor=INK)
-    sSub=ParagraphStyle("su",fontName="Helvetica-Bold",fontSize=11,leading=14,textColor=GREEN)
-    sCan=ParagraphStyle("c", fontName="Helvetica-Bold",fontSize=22,alignment=TA_CENTER,textColor=RED)
-    sCanR=ParagraphStyle("cr",fontName="Helvetica-Bold",fontSize=11,alignment=TA_CENTER,textColor=RED)
-    is_cancelled  = payment.get("status","")=="Cancelled"
-    cancel_reason = payment.get("cancellation_reason","") or ""
-    month_val=payment.get("month",1)
-    try: month_label=MONTHS[int(month_val)-1]
-    except: month_label=str(month_val)
-    payee  = payment.get("payee_name","") or payment.get("payee","") or "—"
-    ptype  = payment.get("payee_type","") or payment.get("payment_type","") or "—"
-    amount = float(payment.get("amount_due",0) or payment.get("amount",0) or 0)
-    ref    = payment.get("reference_no","") or payment.get("payment_ref","") or "—"
-    bank   = payment.get("payee_bank","") or "—"
-    acc    = payment.get("payee_account","") or "—"
-    voucher= payment.get("voucher_no","") or f"PMT-{payment.get('id','?')}"
-    pdate  = payment.get("payment_date","") or "—"
-    method = payment.get("payment_method","") or "—"
-    status = payment.get("status","") or "—"
-    desc   = payment.get("description","") or "—"
-    story=[]
-    story.append(Paragraph("ULU Mahsuri Villa",sT))
-    story.append(Paragraph("Payment Voucher",sSub))
-    story.append(HRFlowable(width="100%",thickness=2,color=GREEN,spaceAfter=10))
-    if is_cancelled:
-        story.append(Paragraph("CANCELLED",sCan))
-        if cancel_reason: story.append(Paragraph(f"Reason: {cancel_reason}",sCanR))
-        story.append(Spacer(1,8))
-        story.append(HRFlowable(width="100%",thickness=1,color=RED,spaceAfter=8))
-    details=[
-        ["Voucher No.",voucher,  "Date",   str(pdate)],
-        ["Payee",      payee,    "Month",  f"{month_label} {payment.get('year','—')}"],
-        ["Type",       ptype,    "Method", method],
-        ["Bank",       bank,     "Acc No.",acc],
-        ["Reference",  ref,      "Status", status],
-    ]
-    det_tbl=Table(details,colWidths=[W*0.18,W*0.32,W*0.18,W*0.32])
-    det_tbl.setStyle(TableStyle([
-        ("FONTNAME",(0,0),(-1,-1),"Helvetica"),("FONTNAME",(0,0),(0,-1),"Helvetica-Bold"),
-        ("FONTNAME",(2,0),(2,-1),"Helvetica-Bold"),("FONTSIZE",(0,0),(-1,-1),9),
-        ("TEXTCOLOR",(0,0),(-1,-1),INK),("TOPPADDING",(0,0),(-1,-1),5),
-        ("BOTTOMPADDING",(0,0),(-1,-1),5),("LINEBELOW",(0,0),(-1,-1),0.3,LIGHT),
-    ]))
-    story.append(det_tbl); story.append(Spacer(1,12))
-    story.append(Paragraph("Description / Purpose:",sB)); story.append(Paragraph(desc,sN)); story.append(Spacer(1,12))
-    bg_col=colors.HexColor("#888") if is_cancelled else GREEN
-    amt_tbl=Table([["Amount (MYR)",f"RM {amount:,.2f}"]],colWidths=[W*0.6,W*0.4])
-    amt_tbl.setStyle(TableStyle([
-        ("BACKGROUND",(0,0),(-1,-1),bg_col),("TEXTCOLOR",(0,0),(-1,-1),colors.white),
-        ("FONTNAME",(0,0),(-1,-1),"Helvetica-Bold"),("FONTSIZE",(0,0),(-1,-1),13),
-        ("ALIGN",(1,0),(1,0),"RIGHT"),("TOPPADDING",(0,0),(-1,-1),10),
-        ("BOTTOMPADDING",(0,0),(-1,-1),10),("LEFTPADDING",(0,0),(-1,-1),12),("RIGHTPADDING",(0,0),(-1,-1),12),
-    ]))
-    story.append(amt_tbl)
-    if is_cancelled and cancel_reason:
-        story.append(Spacer(1,6)); story.append(Paragraph(f"Cancellation reason: {cancel_reason}",sCanR))
-    story.append(Spacer(1,16))
-    story.append(HRFlowable(width="100%",thickness=0.5,color=LIGHT,spaceAfter=8))
-    story.append(Paragraph(f"ULU Mahsuri Villa · Generated {datetime.datetime.now().strftime('%d %B %Y %H:%M')}",sS))
-    doc.build(story); buf.seek(0); return buf.getvalue()
-
-def pv_year_val(r):
-    y=r.get("year")
-    if y: return int(y)
-    ca=str(r.get("created_at",""))
-    return int(ca[:4]) if len(ca)>=4 else 0
-
-def pv_month_val(r):
-    m=r.get("month")
-    if m: return int(m)
-    ca=str(r.get("created_at",""))
-    try: return int(ca[5:7])
-    except: return 0
-
-with tab9:
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown('<p class="card-title">💳 Payments & Vouchers</p>', unsafe_allow_html=True)
-    st.markdown("Record payments to vendors, Property Manager reimbursables, and Archmedia Sdn Bhd management fees. Generate PDF payment vouchers for each transaction.")
-
-    pv_subtab1, pv_subtab2 = st.tabs(["➕ New Payment", "📋 All Payment Records"])
-
-    with pv_subtab1:
-        ym_list_pv = get_year_month_list()
-        ym_labels_pv = [f"{MONTHS[m-1]} {y} ({operation_year(y,m)})" for y,m in ym_list_pv]
-        sel_idx_pv = st.selectbox("Assign payment to month", range(len(ym_labels_pv)),
-            format_func=lambda i: ym_labels_pv[i], key="pv_month")
-        pv_year, pv_month = ym_list_pv[sel_idx_pv]
-
-        # ── Payee autofill from history ──────────────────────────────────────
-        @st.cache_data(ttl=30)
-        def _get_all_payments_for_payee_lookup():
-            conn = get_db()
-            rows = conn.execute("SELECT * FROM payments ORDER BY id", ()).fetchall()
-            conn.close()
-            return [dict(r) for r in rows]
-        _payee_rows = _get_all_payments_for_payee_lookup()
-        payee_lookup = {}
-        for _pr in [dict(r) for r in _payee_rows]:
-            _pname = (_pr.get("payee_name") or "").strip()
-            if _pname:
-                payee_lookup[_pname] = _pr  # later (higher id) rows overwrite → most recent wins
-        payee_options = ["+ New Payee"] + sorted(payee_lookup.keys(), key=str.lower)
-
-        def _apply_payee_autofill():
-            sel = st.session_state.get("pv_payee_select")
-            if sel and sel != "+ New Payee":
-                rec = payee_lookup.get(sel, {})
-                st.session_state["pv_payee"] = rec.get("payee_name","") or ""
-                st.session_state["pv_phone"] = rec.get("payee_phone","") or ""
-                st.session_state["pv_type"]  = rec.get("payee_type") if rec.get("payee_type") in PAYMENT_TYPES else PAYMENT_TYPES[0]
-                st.session_state["pv_bank"]  = rec.get("payee_bank","") or ""
-                st.session_state["pv_acc"]   = rec.get("payee_account","") or ""
-            elif sel == "+ New Payee":
-                for k in ["pv_payee","pv_phone","pv_bank","pv_acc"]:
-                    st.session_state[k] = ""
-                st.session_state["pv_type"] = PAYMENT_TYPES[0]
-
-        st.selectbox("Select Payee (autofills details below — edit as needed)",
-            payee_options, key="pv_payee_select", on_change=_apply_payee_autofill)
-
-        col_a, col_b = st.columns(2, gap="large")
-        with col_a:
-            pv_payee  = st.text_input("Payee Name", placeholder="e.g. Archmedia Sdn Bhd", key="pv_payee")
-            pv_phone  = st.text_input("WhatsApp No. (optional)", key="pv_phone",
-                            placeholder="e.g. 60123456789",
-                            help="Country code + number, no + or leading 0. Used to send the voucher via WhatsApp.")
-            pv_type   = st.selectbox("Payment Type", PAYMENT_TYPES, key="pv_type")
-            pv_desc   = st.text_area("Description / Purpose", height=80, key="pv_desc",
-                            placeholder="e.g. Property Management Fee for June 2026")
-            pv_amount = st.number_input("Amount (RM)", min_value=0.0, step=10.0, format="%.2f", key="pv_amount")
-            pv_date   = st.text_input("Payment Date (YYYY-MM-DD)", value=datetime.date.today().isoformat(), key="pv_date")
-        with col_b:
-            pv_method = st.selectbox("Payment Method",
-                ["Bank Transfer","Cash","Cheque","Online Banking","Other"], key="pv_method")
-            pv_ref    = st.text_input("Payment Reference / Transaction ID",
-                            placeholder="e.g. IBG20260705001", key="pv_ref")
-            pv_bank   = st.text_input("Payee Bank", placeholder="e.g. Maybank / CIMB / RHB", key="pv_bank")
-            pv_acc    = st.text_input("Payee Account No.", placeholder="e.g. 1234567890", key="pv_acc")
-            pv_notes  = st.text_area("Notes", height=60, key="pv_notes")
-
-        st.markdown("**Attachments** — attach multiple files if this payment covers several invoices or receipts")
-        fcol1, fcol2 = st.columns(2)
-        pv_invoice_files = fcol1.file_uploader("📎 Attach Claim Invoice(s)", type=["jpg","jpeg","png","pdf"],
-                            key="pv_invoice_upload", accept_multiple_files=True)
-        pv_proof_files   = fcol2.file_uploader("📎 Attach Proof of Payment(s)", type=["jpg","jpeg","png","pdf"],
-                            key="pv_proof_upload", accept_multiple_files=True)
-
-        if st.button("💾 Save Payment & Generate Voucher", type="primary", key="btn_save_pv"):
-            if not pv_payee or pv_amount <= 0:
-                st.error("Payee name and amount are required.")
-            else:
-                # Insert directly via the Supabase client so we get the new row's id
-                # back immediately — needed for PV-{id:05d} voucher numbering and to
-                # name attachment files consistently.
-                sb = get_supabase()
-                insert_res = sb.table("payments").insert({
-                    "year": pv_year, "month": pv_month,
-                    "payee_name": pv_payee, "payee_phone": pv_phone, "payee_type": pv_type,
-                    "description": pv_desc, "amount_due": pv_amount, "payment_date": pv_date,
-                    "payment_method": pv_method, "reference_no": pv_ref,
-                    "payee_bank": pv_bank, "payee_account": pv_acc,
-                    "notes": pv_notes, "status": "Pending",
-                }).execute()
-                new_id = insert_res.data[0]["id"] if insert_res.data else None
-                voucher_no = f"PV-{new_id:05d}" if new_id else f"PV-{pv_year}-{pv_month:02d}"
-
-                invoice_storage_paths = []
-                proof_storage_paths   = []
-
-                for idx, f in enumerate(pv_invoice_files or []):
-                    file_bytes = f.read()
-                    sp = upload_payment_file(file_bytes, f.name, "claim_invoice")
-                    if sp: invoice_storage_paths.append(sp)
-                    save_payment_attachment_local(file_bytes, f.name, "Claim Invoices", voucher_no, index=idx)
-
-                for idx, f in enumerate(pv_proof_files or []):
-                    file_bytes = f.read()
-                    sp = upload_payment_file(file_bytes, f.name, "proof")
-                    if sp: proof_storage_paths.append(sp)
-                    save_payment_attachment_local(file_bytes, f.name, "Proof of Payment", voucher_no, index=idx)
-
-                if new_id:
-                    sb.table("payments").update({
-                        "voucher_no": voucher_no,
-                        "claim_invoice_path": json.dumps(invoice_storage_paths) if invoice_storage_paths else None,
-                        "proof_of_payment_path": json.dumps(proof_storage_paths) if proof_storage_paths else None,
-                    }).eq("id", new_id).execute()
-
-                pd_dict = {
-                    "voucher_no":voucher_no,"year":pv_year,"month":pv_month,
-                    "payee_name":pv_payee,"payee_phone":pv_phone,"payee_type":pv_type,"description":pv_desc,
-                    "amount_due":pv_amount,"payment_date":pv_date,"payment_method":pv_method,
-                    "reference_no":pv_ref,"payee_bank":pv_bank,"payee_account":pv_acc,
-                    "status":"Pending","cancellation_reason":""
-                }
-                pdf_bytes = generate_payment_voucher_pdf(pd_dict)
-                save_voucher_pdf_local(pdf_bytes, voucher_no)
-                st.success(f"Payment saved. Voucher: **{voucher_no}**")
-                if invoice_storage_paths or proof_storage_paths:
-                    n_files = len(invoice_storage_paths) + len(proof_storage_paths)
-                    st.caption(f"{n_files} attachment(s) saved to secure storage" +
-                               (" and the local Payment Voucher Attachments folder." if not is_running_on_cloud() else "."))
-                st.download_button(f"⬇️ Download {voucher_no}.pdf", data=pdf_bytes,
-                    file_name=f"{voucher_no}.pdf", mime="application/pdf", key=f"dl_new_{voucher_no}")
-
-                phone_clean = (pv_phone or "").strip().lstrip("+").replace(" ","").replace("-","")
-                if phone_clean:
-                    wa_text = f"Payment Voucher {voucher_no} — {pv_payee} — {fmt_myr(pv_amount)}. Please find the voucher PDF attached."
-                    import urllib.parse as _up
-                    wa_url = f"https://wa.me/{phone_clean}?text={_up.quote(wa_text)}"
-                    st.markdown(f"[📱 Send via WhatsApp]({wa_url}) — note: WhatsApp links can't attach the PDF automatically; download it above first, then attach manually in the chat.")
-                st.rerun()
-
-    with pv_subtab2:
-        with st.expander("🗂️ One-time: Backfill Legacy Voucher PDFs to Local Folder"):
-            st.caption("Regenerates a voucher PDF for every payment record on file (including old PMT-1–8 "
-                       "style entries) and saves them into the local Vouchers folder. Does not touch the "
-                       "database — safe to run any time, including repeatedly.")
-            if is_running_on_cloud():
-                st.info("This only writes files when the app is run locally (not on Streamlit Cloud), "
-                        "since cloud disk resets on redeploy. Run this from your local machine.")
-            if st.button("🔄 Regenerate All Voucher PDFs", key="btn_backfill_vouchers"):
-                conn = get_db()
-                backfill_rows = conn.execute("SELECT * FROM payments ORDER BY id", ()).fetchall()
-                conn.close()
-                count = 0
-                for br in [dict(r) for r in backfill_rows]:
-                    br_id = br.get("id")
-                    br_voucher = br.get("voucher_no") or f"PV-{br_id:05d}"
-                    br_pdf = generate_payment_voucher_pdf(br)
-                    saved_path = save_voucher_pdf_local(br_pdf, br_voucher)
-                    if saved_path:
-                        count += 1
-                if count:
-                    st.success(f"✓ Regenerated {count} voucher PDF(s) into the local Vouchers folder.")
-                else:
-                    st.warning("No files were written — this only works when running locally.")
-
-        pf1, pf2, pf3 = st.columns(3)
-        filter_year   = pf1.selectbox("Year",  list(range(datetime.datetime.now().year, 2023, -1)), key="pv_filter_yr")
-        filter_month  = pf2.selectbox("Month", ["All"] + MONTHS, key="pv_filter_mo")
-        filter_status = pf3.selectbox("Status", ["All"] + PAYMENT_STATUSES, key="pv_filter_st")
-
-        conn = get_db()
-        all_pv = conn.execute("SELECT * FROM payments ORDER BY id DESC", ()).fetchall()
-        conn.close()
-
-        pv_rows = [r for r in all_pv if pv_year_val(r) == filter_year]
-        if filter_month != "All":
-            mo_num = MONTHS.index(filter_month) + 1
-            pv_rows = [r for r in pv_rows if pv_month_val(r) == mo_num]
-        if filter_status != "All":
-            pv_rows = [r for r in pv_rows if r.get("status","") == filter_status]
-
-        active_rows  = [r for r in pv_rows if r.get("status","") != "Cancelled"]
-        total_amount = sum(float(r.get("amount_due",0) or 0) for r in active_rows)
-        paid_rows    = [r for r in active_rows if r.get("status","") == "Paid"]
-        total_paid   = sum(float(r.get("amount_due",0) or 0) for r in paid_rows)
-        total_pending= total_amount - total_paid
-
-        mc1,mc2,mc3,mc4 = st.columns(4)
-        mc1.metric("Total Records", len(pv_rows))
-        mc2.metric("Total Due (excl. cancelled)", fmt_myr(total_amount))
-        mc3.metric("Total Paid", fmt_myr(total_paid))
-        mc4.metric("Outstanding", fmt_myr(total_pending))
-        st.divider()
-
-        if not pv_rows:
-            st.info("No payment records for this period.")
-        else:
-            for r in [dict(r) for r in pv_rows]:
-                r_id        = r.get("id")
-                r_status    = r.get("status","Pending") or "Pending"
-                r_icon      = STATUS_ICONS.get(r_status,"⚪")
-                is_canc     = r_status == "Cancelled"
-                canc_reason = r.get("cancellation_reason","") or ""
-                payee_disp  = r.get("payee_name","") or r.get("payee","") or "—"
-                amount_disp = float(r.get("amount_due",0) or 0)
-                voucher_disp= r.get("voucher_no","") or f"PV-{r_id:05d}"
-                mo_d = pv_month_val(r); yr_d = pv_year_val(r)
-
-                header_label = f"{r_icon} **{voucher_disp}** — {payee_disp} — {fmt_myr(amount_disp)}"
-                if is_canc: header_label += " *(Cancelled)*"
-
-                with st.expander(header_label, expanded=False):
-                    if is_canc and canc_reason:
-                        st.warning(f"🚫 Cancelled — Reason: {canc_reason}")
-
-                    d1,d2,d3 = st.columns(3)
-                    d1.markdown(f"**Date:** {r.get('payment_date','—')}")
-                    d2.markdown(f"**Month:** {MONTHS[mo_d-1] if mo_d else '—'} {yr_d or '—'}")
-                    d3.markdown(f"**Type:** {r.get('payee_type','') or r.get('payment_type','') or '—'}")
-                    d4,d5,d6 = st.columns(3)
-                    d4.markdown(f"**Method:** {r.get('payment_method','—')}")
-                    d5.markdown(f"**Ref:** {r.get('reference_no','') or r.get('payment_ref','') or '—'}")
-                    d6.markdown(f"**Bank:** {r.get('payee_bank','—')} / {r.get('payee_account','—')}")
-                    st.markdown(f"**Description:** {r.get('description','—')}")
-                    if r.get("notes"): st.markdown(f"**Notes:** {r.get('notes','')}")
-
-                    inv_paths   = parse_attachment_paths(r.get("claim_invoice_path"))
-                    proof_paths = parse_attachment_paths(r.get("proof_of_payment_path"))
-                    if inv_paths or proof_paths:
-                        att1, att2 = st.columns(2)
-                        if inv_paths:
-                            att1.markdown(f"📎 **Claim Invoice(s)** ({len(inv_paths)}):")
-                            for i, p in enumerate(inv_paths, 1):
-                                url = get_payment_file_url(p)
-                                if url:
-                                    att1.markdown(f"&nbsp;&nbsp;[Invoice {i}]({url})")
-                        else:
-                            att1.caption("No claim invoice attached")
-                        if proof_paths:
-                            att2.markdown(f"📎 **Proof of Payment** ({len(proof_paths)}):")
-                            for i, p in enumerate(proof_paths, 1):
-                                url = get_payment_file_url(p)
-                                if url:
-                                    att2.markdown(f"&nbsp;&nbsp;[Proof {i}]({url})")
-                        else:
-                            att2.caption("No proof of payment attached")
-
-                    st.divider()
-                    act1,act2,act3,act4 = st.columns([2,1,2,2])
-
-                    if not is_canc:
-                        safe_statuses = [s for s in PAYMENT_STATUSES if s != "Cancelled"]
-                        cur_idx = safe_statuses.index(r_status) if r_status in safe_statuses else 0
-                        new_status = act1.selectbox("Status", safe_statuses, index=cur_idx,
-                            key=f"pv_status_{r_id}", label_visibility="collapsed")
-                        if act2.button("Update", key=f"pv_upd_{r_id}"):
-                            conn = get_db()
-                            conn.execute("UPDATE payments SET status=? WHERE id=?",(new_status,r_id))
-                            conn.commit(); conn.close(); st.rerun()
-                    else:
-                        act1.markdown("<span class='badge-cancelled'>⚫ Cancelled</span>", unsafe_allow_html=True)
-
-                    pdf_bytes = generate_payment_voucher_pdf(r)
-                    suffix = "_CANCELLED" if is_canc else ""
-                    act3.download_button("⬇️ Voucher PDF", data=pdf_bytes,
-                        file_name=f"{voucher_disp}{suffix}.pdf", mime="application/pdf",
-                        key=f"dl_pv_{r_id}")
-
-                    r_phone = (r.get("payee_phone") or "").strip().lstrip("+").replace(" ","").replace("-","")
-                    if r_phone:
-                        import urllib.parse as _up
-                        wa_text_r = f"Payment Voucher {voucher_disp} — {payee_disp} — {fmt_myr(amount_disp)}. Please find the voucher PDF attached."
-                        wa_url_r = f"https://wa.me/{r_phone}?text={_up.quote(wa_text_r)}"
-                        st.markdown(f"[📱 Resend via WhatsApp]({wa_url_r})")
-
-                    if not is_canc:
-                        if act4.button("🚫 Cancel Record", key=f"pv_cancel_btn_{r_id}"):
-                            st.session_state[f"show_cancel_{r_id}"] = True
-                    else:
-                        if act4.button("🗑️ Delete", key=f"pv_del_{r_id}"):
-                            conn = get_db()
-                            conn.execute("DELETE FROM payments WHERE id=?",(r_id,))
-                            conn.commit(); conn.close(); st.rerun()
-
-                    if st.session_state.get(f"show_cancel_{r_id}"):
-                        st.markdown("---")
-                        st.error("**Cancel this payment record — this cannot be undone.**")
-                        cancel_input = st.text_input("Reason for cancellation (required)",
-                            key=f"cancel_reason_{r_id}",
-                            placeholder="e.g. Duplicate entry / Wrong amount / Payment reversed")
-                        cc1,cc2 = st.columns(2)
-                        if cc1.button("Confirm Cancellation", key=f"cancel_confirm_{r_id}", type="primary"):
-                            if not cancel_input.strip():
-                                st.error("A reason is required before confirming cancellation.")
-                            else:
-                                conn = get_db()
-                                conn.execute(
-                                    "UPDATE payments SET status='Cancelled', cancellation_reason=? WHERE id=?",
-                                    (cancel_input.strip(), r_id)
-                                )
-                                conn.commit(); conn.close()
-                                st.session_state.pop(f"show_cancel_{r_id}", None)
-                                st.success("Record cancelled and reason recorded.")
-                                st.rerun()
-                        if cc2.button("Back", key=f"cancel_back_{r_id}"):
-                            st.session_state.pop(f"show_cancel_{r_id}", None); st.rerun()
-
-    st.markdown('</div>', unsafe_allow_html=True)
-
-
-# ══════════════════════════════════════════════
-# TAB 10 — DIRECT INCOME & EXTRAS
-# ══════════════════════════════════════════════
-with tab10:
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown('<p class="card-title">💰 Direct Income & Extras</p>', unsafe_allow_html=True)
-    st.markdown(
-        "Upload the Airbnb monthly CSV — the app automatically compares it against "
-        "the Manager's report already in the database and identifies Direct bookings "
-        "and Extra charges. **Supplementary register only — does not affect P&L.**"
-    )
-
-    di_subtab1, di_subtab2 = st.tabs([
-        "📋 All Records", "📊 Dashboard"
-    ])
-
-    # ── ALL RECORDS ─────────────────────────────────────────────────────────────
-    with di_subtab1:
-        rf1, rf2, rf3 = st.columns(3)
-        di_filter_yr   = rf1.selectbox("Year",  list(range(datetime.datetime.now().year,2023,-1)), key="di_fyr")
-        di_filter_mo   = rf2.selectbox("Month", ["All"] + MONTHS, key="di_fmo")
-        di_filter_type = rf3.selectbox("Type",  ["All"] + DIRECT_INCOME_TYPES, key="di_ftype")
-
-        conn = get_db()
-        if di_filter_mo == "All":
-            di_rows = conn.execute(
-                "SELECT * FROM direct_income WHERE year=? ORDER BY month DESC, id DESC",
-                (di_filter_yr,)
-            ).fetchall()
-        else:
-            mo_num = MONTHS.index(di_filter_mo) + 1
-            di_rows = conn.execute(
-                "SELECT * FROM direct_income WHERE year=? AND month=? ORDER BY id DESC",
-                (di_filter_yr, mo_num)
-            ).fetchall()
-        conn.close()
-
-        if di_filter_type != "All":
-            di_rows = [r for r in di_rows if r.get("income_type","") == di_filter_type]
-
-        if not di_rows:
-            st.info("No direct income entries for this period.")
-        else:
-            total_di = sum(float(r.get("amount",0) or 0) for r in di_rows)
-            m1, m2 = st.columns(2)
-            m1.metric("Total Entries", len(di_rows))
-            m2.metric("Total Amount", fmt_myr(total_di))
-            st.divider()
-
-            for r in [dict(r) for r in di_rows]:
-                r_id = r.get("id")
-                mo_label = MONTHS[int(r.get("month",1))-1]
-                with st.expander(
-                    f"**{mo_label} {r.get('year')}** — {r.get('guest_name','—')} — "
-                    f"{r.get('income_type','—')} — {fmt_myr(r.get('amount',0))}",
-                    expanded=False
-                ):
-                    d1, d2, d3 = st.columns(3)
-                    d1.markdown(f"**Date:** {r.get('date_received','—')}")
-                    d2.markdown(f"**Method:** {r.get('payment_method','—')}")
-                    d3.markdown(f"**Ref:** {r.get('reference','—')}")
-                    if r.get("notes"):
-                        st.markdown(f"**Notes:** {r.get('notes','')}")
-
-                    st.divider()
-                    _, del_col = st.columns([4, 1])
-                    if del_col.button("🗑️ Delete", key=f"di_del_{r_id}"):
-                        st.session_state[f"di_confirm_del_{r_id}"] = True
-
-                    if st.session_state.get(f"di_confirm_del_{r_id}"):
-                        st.error("Delete this record permanently?")
-                        cc1, cc2 = st.columns(2)
-                        if cc1.button("✅ Yes", key=f"di_del_yes_{r_id}", type="primary"):
-                            conn = get_db()
-                            conn.execute("DELETE FROM direct_income WHERE id=?", (r_id,))
-                            conn.commit(); conn.close()
-                            st.session_state.pop(f"di_confirm_del_{r_id}", None)
-                            st.rerun()
-                        if cc2.button("❌ Cancel", key=f"di_del_no_{r_id}"):
-                            st.session_state.pop(f"di_confirm_del_{r_id}", None)
-                            st.rerun()
-
-    # ── DASHBOARD ───────────────────────────────────────────────────────────────
-    with di_subtab2:
-        conn = get_db()
-        all_di = conn.execute(
-            "SELECT * FROM direct_income ORDER BY year, month", ()
-        ).fetchall()
-        # Fetch ALL bookings — group in Python to avoid adapter GROUP BY issues
-        all_bk_rows = conn.execute(
-            "SELECT year, month, source, amount FROM bookings", ()
-        ).fetchall()
-        conn.close()
-
-        if not all_di:
-            st.info("No direct income entries yet. Upload an Airbnb CSV via Tab 2 → Airbnb CSV & Reconcile.")
-        else:
-            # Build monthly lookups in Python
-            monthly_di = {}
-            for r in all_di:
-                key = (int(r.get("year",0)), int(r.get("month",0)))
-                monthly_di[key] = monthly_di.get(key, 0) + float(r.get("amount",0) or 0)
-
-            monthly_bk_airbnb = {}  # Airbnb-only per month
-            monthly_bk_all    = {}  # All bookings per month
-            for r in all_bk_rows:
-                key = (int(r.get("year",0)), int(r.get("month",0)))
-                amt = float(r.get("amount",0) or 0)
-                monthly_bk_all[key] = monthly_bk_all.get(key, 0) + amt
-                if (r.get("source","") or "").upper() == "AIRBNB":
-                    monthly_bk_airbnb[key] = monthly_bk_airbnb.get(key, 0) + amt
-
-            total_direct   = sum(monthly_di.values())
-            total_airbnb   = sum(monthly_bk_airbnb.values())
-            total_combined = sum(monthly_bk_all.values())
-
-            at1, at2, at3, at4 = st.columns(4)
-            at1.metric("Airbnb Income",  fmt_myr(total_airbnb))
-            at2.metric("Direct/Extras",  fmt_myr(total_direct))
-            at3.metric("Combined Total", fmt_myr(total_combined))
-            at4.metric("Direct %",
-                f"{total_direct/total_combined*100:.1f}%"
-                if total_combined > 0 else "—")
-
-            st.divider()
-
-            # By type breakdown
-            st.markdown("**Breakdown by Income Type:**")
-            type_totals = {}
-            for r in all_di:
-                t = r.get("income_type","Other")
-                type_totals[t] = type_totals.get(t, 0) + float(r.get("amount",0) or 0)
-            type_rows = [
-                {"Type": k, "Amount (RM)": fmt_myr(v),
-                 "% of Direct": f"{v/total_direct*100:.1f}%"}
-                for k,v in sorted(type_totals.items(), key=lambda x:-x[1])
-            ]
-            st.dataframe(pd.DataFrame(type_rows), use_container_width=True, hide_index=True)
-
-            st.divider()
-
-            # Monthly trend
-            st.markdown("**Monthly Summary — Airbnb vs Direct/Extras:**")
-            trend_rows = []
-            for (yr, mo), direct_amt in sorted(monthly_di.items()):
-                airbnb_mo   = monthly_bk_airbnb.get((yr, mo), 0)
-                combined_mo = monthly_bk_all.get((yr, mo), 0)
-                pct = direct_amt/combined_mo*100 if combined_mo > 0 else 0
-                trend_rows.append({
-                    "Month":              f"{MONTHS[mo-1]} {yr}",
-                    "Airbnb (RM)":        fmt_myr(airbnb_mo),
-                    "Direct/Extras (RM)": fmt_myr(direct_amt),
-                    "Combined (RM)":      fmt_myr(combined_mo),
-                    "Direct %":           f"{pct:.1f}%",
-                })
-            if trend_rows:
-                st.dataframe(pd.DataFrame(trend_rows), use_container_width=True, hide_index=True)
-
-            st.info(
-                "💡 **Note for ULU 2 feasibility:** Use Airbnb Income only as the benchmark. "
-                "Direct/Extras are non-recurring and should not be projected as future income."
-            )
-
-    st.markdown('</div>', unsafe_allow_html=True)
-
-
-# ══════════════════════════════════════════════
-# TAB 11 — TRENDS & ANALYTICS
-# ══════════════════════════════════════════════
-@st.cache_data(ttl=60)
-def _build_trend_dataframe():
-    """Assemble one row per (year, month) with everything needed for trend
-    charts: ADR, occupancy, net margin %, and Airbnb vs Direct mix.
-    Cached — this pulls several full-table scans and shouldn't re-run on
-    every click."""
-    conn = get_db()
-    all_bookings = conn.execute("SELECT year, month, amount, nights, source FROM bookings", ()).fetchall()
-    all_scans    = conn.execute("SELECT year, month, occupancy_pct FROM manager_monthly_scans", ()).fetchall()
-    conn.close()
-
-    occ_lookup = {}
-    for s in all_scans:
-        occ_lookup[(int(s["year"]), int(s["month"]))] = float(s.get("occupancy_pct") or 0)
-
-    monthly = {}
-    for b in all_bookings:
-        key = (int(b["year"]), int(b["month"]))
-        if key not in monthly:
-            monthly[key] = {"gross": 0.0, "nights": 0, "airbnb": 0.0, "direct": 0.0}
-        amt = float(b.get("amount") or 0)
-        nts = int(b.get("nights") or 0)
-        monthly[key]["gross"] += amt
-        monthly[key]["nights"] += nts
-        if (b.get("source") or "").upper() == "AIRBNB":
-            monthly[key]["airbnb"] += amt
-        else:
-            monthly[key]["direct"] += amt
-
-    rows = []
-    for (yr, mo), v in sorted(monthly.items()):
-        summary = get_monthly_summary(yr, mo)
-        adr = (v["gross"] / v["nights"]) if v["nights"] else 0
-        net_margin = (summary["owner_share"] / summary["gross_income"] * 100) if summary["gross_income"] else 0
-        direct_pct = (v["direct"] / v["gross"] * 100) if v["gross"] else 0
-        rows.append({
-            "year": yr, "month": mo,
-            "label": f"{MONTHS[mo-1]} {yr}",
-            "adr": round(adr, 2),
-            "occupancy_pct": occ_lookup.get((yr, mo), None),
-            "net_margin_pct": round(net_margin, 1),
-            "direct_pct": round(direct_pct, 1),
-            "gross_income": v["gross"],
-            "nights": v["nights"],
-        })
-    return pd.DataFrame(rows)
-
-
-with tab11:
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown('<p class="card-title">📉 Trends & Analytics</p>', unsafe_allow_html=True)
-    st.caption("How ULU 1 is trending over time, built from your existing bookings and manager report data — "
-               "no extra data entry needed.")
-
-    tdf = _build_trend_dataframe()
-
-    if tdf.empty or len(tdf) < 2:
-        st.info("Not enough months of data yet to show trends — this fills in automatically as more "
-                "monthly reports are scanned.")
-    else:
-        # ── EDITABLE ALERT THRESHOLDS ────────────────────────────────────────
-        # These live as settings (not hardcoded) since targets change over time —
-        # e.g. ADR target only applies once the ULU 1 refresh is complete and
-        # live, and should be updated again whenever pricing is revised.
-        with st.expander("⚙️ Adjust Alert Thresholds"):
-            st.caption("Update these whenever pricing or feasibility targets change — the alerts "
-                       "below always check against whatever's set here.")
-            th1, th2, th3 = st.columns(3)
-            adr_min = th1.number_input("ADR target — min (RM/night)",
-                value=float(get_setting("adr_target_min") or 850), step=10.0, key="adr_target_min_input")
-            adr_max = th2.number_input("ADR target — max (RM/night)",
-                value=float(get_setting("adr_target_max") or 1300), step=10.0, key="adr_target_max_input")
-            occ_gate = th3.number_input("Occupancy gate (%)",
-                value=float(get_setting("occupancy_gate_pct") or 75), step=1.0, key="occ_gate_input")
-
-            st.markdown("**ULU 2 peak-season evaluation window**")
-            th4, th5 = st.columns(2)
-            gate_adr_min = th4.number_input("ULU 2 gate — min ADR (RM/night)",
-                value=float(get_setting("gate_adr_min") or 750), step=10.0, key="gate_adr_min_input",
-                help="Separate from the general ADR target above — this is specifically the ULU 2 go/no-go threshold.")
-            gate_occ_min = th5.number_input("ULU 2 gate — min occupancy (%)",
-                value=float(get_setting("gate_occ_min") or 75), step=1.0, key="gate_occ_min_input")
-            th6, th7 = st.columns(2)
-            season_start = th6.text_input("Peak season start (YYYY-MM)",
-                value=get_setting("peak_season_start") or "2026-11", key="season_start_input")
-            season_end = th7.text_input("Peak season end (YYYY-MM)",
-                value=get_setting("peak_season_end") or "2027-02", key="season_end_input")
-
-            if st.button("💾 Save Thresholds", key="btn_save_thresholds"):
-                set_setting("adr_target_min", adr_min)
-                set_setting("adr_target_max", adr_max)
-                set_setting("occupancy_gate_pct", occ_gate)
-                set_setting("gate_adr_min", gate_adr_min)
-                set_setting("gate_occ_min", gate_occ_min)
-                set_setting("peak_season_start", season_start)
-                set_setting("peak_season_end", season_end)
-                st.success("Saved.")
-                st.rerun()
-
-        adr_target_min = float(get_setting("adr_target_min") or 850)
-        adr_target_max = float(get_setting("adr_target_max") or 1300)
-        occupancy_gate = float(get_setting("occupancy_gate_pct") or 75)
-        gate_adr_min = float(get_setting("gate_adr_min") or 750)
-        gate_occ_min = float(get_setting("gate_occ_min") or 75)
-        peak_season_start = get_setting("peak_season_start") or "2026-11"
-        peak_season_end = get_setting("peak_season_end") or "2027-02"
-
-        # ── DETECT PEAK SEASON FROM HISTORY ──────────────────────────────────
-        with st.expander("📅 Detect Peak Season from History"):
-            years_of_data = tdf["year"].nunique()
-            st.caption(f"Average occupancy by calendar month, across {years_of_data} year(s) of data on file. "
-                       f"{'⚠️ Limited reliability with under 2 years of history — treat as a rough signal, not a confident pattern.' if years_of_data < 2 else 'Based on enough history to be a reasonable signal.'}")
-
-            occ_by_cal_month = tdf.dropna(subset=["occupancy_pct"]).groupby("month")["occupancy_pct"].mean()
-            if occ_by_cal_month.empty:
-                st.info("No occupancy data scanned yet — this fills in as monthly reports are added.")
-            else:
-                cal_month_df = pd.DataFrame({
-                    "Month": [MONTHS[m-1] for m in occ_by_cal_month.index],
-                    "Avg Occupancy %": occ_by_cal_month.values
-                }).set_index("Month")
-                st.bar_chart(cal_month_df)
-
-                overall_avg = occ_by_cal_month.mean()
-                peak_months_nums = sorted(occ_by_cal_month[occ_by_cal_month >= overall_avg].index.tolist())
-
-                # Find the longest contiguous run of peak months, wrapping across year-end (e.g. Nov-Dec-Jan-Feb)
-                def _longest_contiguous_run(months_list):
-                    if not months_list:
-                        return []
-                    extended = set(months_list) | {m+12 for m in months_list if m <= 12}
-                    best_run, current_run = [], []
-                    for m in range(1, 25):
-                        if m in extended or (m > 12 and (m-12) in months_list):
-                            current_run.append(m)
-                        else:
-                            if len(current_run) > len(best_run):
-                                best_run = current_run
-                            current_run = []
-                    if len(current_run) > len(best_run):
-                        best_run = current_run
-                    return [((m-1) % 12) + 1 for m in best_run]
-
-                suggested_run = _longest_contiguous_run(peak_months_nums)
-
-                if suggested_run:
-                    suggested_names = [MONTHS[m-1] for m in suggested_run]
-                    st.markdown(f"**Months at or above average occupancy ({overall_avg:.0f}%):** " +
-                                ", ".join(MONTHS[m-1] for m in peak_months_nums))
-                    st.markdown(f"**Suggested contiguous peak window:** {' → '.join(suggested_names)}")
-
-                    if st.button("Use this as the peak season window", key="btn_use_suggested_season"):
-                        latest_yr = int(tdf["year"].max())
-                        start_m = suggested_run[0]
-                        end_m = suggested_run[-1]
-                        start_yr = latest_yr
-                        end_yr = start_yr + 1 if end_m < start_m else start_yr
-                        set_setting("peak_season_start", f"{start_yr}-{start_m:02d}")
-                        set_setting("peak_season_end", f"{end_yr}-{end_m:02d}")
-                        st.success(f"Peak season window updated to {start_yr}-{start_m:02d} → {end_yr}-{end_m:02d}. "
-                                   f"Scroll down to the threshold settings to review.")
-                        st.rerun()
-                else:
-                    st.info("No clear contiguous peak pattern detected yet.")
-
-        # ── ULU 2 GO / NO-GO VERDICT ─────────────────────────────────────────
-        st.markdown("#### 🚦 ULU 2 Go / No-Go")
-        try:
-            sy, sm = [int(x) for x in peak_season_start.split("-")]
-            ey, em = [int(x) for x in peak_season_end.split("-")]
-            season_df = tdf[
-                ((tdf["year"] > sy) | ((tdf["year"] == sy) & (tdf["month"] >= sm))) &
-                ((tdf["year"] < ey) | ((tdf["year"] == ey) & (tdf["month"] <= em)))
-            ]
-        except Exception:
-            season_df = pd.DataFrame()
-            st.error("Peak season dates above are malformed — use YYYY-MM format.")
-
-        if season_df.empty:
-            st.info(f"No data yet within the peak-season window ({peak_season_start} to {peak_season_end}). "
-                    f"This fills in as monthly reports are scanned through that period.")
-        else:
-            avg_adr = season_df["adr"].mean()
-            avg_occ = season_df["occupancy_pct"].mean()  # NaN-safe; ignores months with no scan yet
-            months_covered = len(season_df)
-            try:
-                total_window_months = (ey - sy) * 12 + (em - sm) + 1
-            except Exception:
-                total_window_months = months_covered
-            window_complete = months_covered >= total_window_months
-
-            adr_pass = avg_adr >= gate_adr_min
-            occ_pass = pd.notna(avg_occ) and avg_occ >= gate_occ_min
-
-            if adr_pass and occ_pass and window_complete:
-                verdict, color = "✅ GO", "success"
-            elif adr_pass and occ_pass and not window_complete:
-                verdict, color = "🟡 ON TRACK (window not yet complete)", "warning"
-            elif window_complete:
-                verdict, color = "🔴 NO-GO", "error"
-            else:
-                verdict, color = "🟡 NOT YET THERE", "warning"
-
-            vc1, vc2, vc3, vc4 = st.columns(4)
-            vc1.metric("Verdict", verdict)
-            vc2.metric("Avg ADR (window)", f"RM {avg_adr:,.0f}",
-                       delta=f"{avg_adr - gate_adr_min:+,.0f} vs RM{gate_adr_min:,.0f} gate")
-            vc3.metric("Avg Occupancy (window)",
-                       f"{avg_occ:.0f}%" if pd.notna(avg_occ) else "—",
-                       delta=f"{avg_occ - gate_occ_min:+.0f}pp vs {gate_occ_min:.0f}% gate" if pd.notna(avg_occ) else None)
-            vc4.metric("Months Covered", f"{months_covered} / {total_window_months}")
-
-            getattr(st, color)(
-                f"**{verdict}** — averaged across {peak_season_start} to {peak_season_end}: "
-                f"RM{avg_adr:,.0f} ADR ({'meets' if adr_pass else 'below'} the RM{gate_adr_min:,.0f} gate), "
-                f"{avg_occ:.0f}% occupancy "
-                f"({'meets' if occ_pass else 'below'} the {gate_occ_min:.0f}% gate)."
-                if pd.notna(avg_occ) else
-                f"**{verdict}** — averaged across {peak_season_start} to {peak_season_end}: "
-                f"RM{avg_adr:,.0f} ADR ({'meets' if adr_pass else 'below'} the RM{gate_adr_min:,.0f} gate). "
-                f"Occupancy data incomplete for this window."
-            )
-
-            with st.expander("Month-by-month breakdown for this window"):
-                season_display = season_df[["label", "adr", "occupancy_pct"]].copy()
-                season_display.columns = ["Month", "ADR (RM)", "Occupancy %"]
-                season_display["ADR (RM)"] = season_display["ADR (RM)"].apply(lambda x: f"{x:,.0f}")
-                season_display["Occupancy %"] = season_display["Occupancy %"].apply(
-                    lambda x: f"{x:.0f}%" if pd.notna(x) else "—")
-                st.dataframe(season_display, use_container_width=True, hide_index=True)
-
-            # ── AFFORDABLE CONSTRUCTION BUDGET CEILING ────────────────────────
-            # Only meaningful once trending toward GO — a NO-GO doesn't need a
-            # budget ceiling since the project shouldn't proceed at all.
-            if adr_pass and occ_pass and pd.notna(avg_occ):
-                st.markdown("#### 💰 If GO — Target Construction Budget Ceiling")
-                st.caption("Works backward from ULU 1's achieved rate/occupancy to what ULU 2's construction "
-                           "budget can actually support. Overspending this ceiling risks turning a real GO "
-                           "into a loss-making decision even at the same rate and occupancy.")
-
-                with st.expander("⚙️ Adjust Budget Assumptions"):
-                    bc1, bc2 = st.columns(2)
-                    payback_years = bc1.number_input("Target payback period (years)",
-                        value=float(get_setting("ulu2_payback_years") or 5), step=1.0, key="payback_years_input")
-                    default_margin = tdf["net_margin_pct"].tail(6).mean() if len(tdf) >= 1 else 30.0
-                    assumed_margin = bc2.number_input("Assumed net margin % (ULU 2)",
-                        value=float(get_setting("ulu2_assumed_margin") or default_margin), step=1.0,
-                        key="assumed_margin_input",
-                        help="Defaults to ULU 1's own recent average net margin, as a reasonable proxy "
-                             "since ULU 2 will likely share a similar cost structure and profit-sharing terms.")
-                    planned_capex = st.number_input("Planned/Actual Construction Budget (RM)",
-                        value=float(get_setting("ulu2_planned_capex") or 616600), step=1000.0,
-                        key="planned_capex_input", help="Defaults to the QS cost estimate on file.")
-                    if st.button("💾 Save Budget Assumptions", key="btn_save_budget"):
-                        set_setting("ulu2_payback_years", payback_years)
-                        set_setting("ulu2_assumed_margin", assumed_margin)
-                        set_setting("ulu2_planned_capex", planned_capex)
-                        st.success("Saved.")
-                        st.rerun()
-
-                payback_years = float(get_setting("ulu2_payback_years") or 5)
-                assumed_margin = float(get_setting("ulu2_assumed_margin") or default_margin)
-                planned_capex = float(get_setting("ulu2_planned_capex") or 616600)
-
-                projected_nights_per_year = 365 * (avg_occ / 100)
-                projected_gross_per_year = avg_adr * projected_nights_per_year
-                projected_net_per_year = projected_gross_per_year * (assumed_margin / 100)
-                max_affordable_capex = projected_net_per_year * payback_years
-
-                bc_col1, bc_col2, bc_col3 = st.columns(3)
-                bc_col1.metric("Projected Net Income / Year", fmt_myr(projected_net_per_year),
-                    help=f"RM{avg_adr:,.0f} ADR × {projected_nights_per_year:.0f} nights/yr × {assumed_margin:.0f}% margin")
-                bc_col2.metric(f"Affordable Budget ({payback_years:.0f}-yr payback)", fmt_myr(max_affordable_capex))
-                budget_delta = max_affordable_capex - planned_capex
-                bc_col3.metric("Planned Budget", fmt_myr(planned_capex),
-                    delta=f"{budget_delta:+,.0f} headroom" if budget_delta >= 0 else f"{budget_delta:,.0f} over ceiling")
-
-                if planned_capex > max_affordable_capex:
-                    over_by = planned_capex - max_affordable_capex
-                    implied_years = (planned_capex / projected_net_per_year) if projected_net_per_year > 0 else float('inf')
-                    st.error(
-                        f"**⚠️ Planned budget exceeds the affordable ceiling by {fmt_myr(over_by)}.** "
-                        f"At the planned {fmt_myr(planned_capex)} spend, actual payback would be "
-                        f"~{implied_years:.1f} years, not the {payback_years:.0f}-year target — this is exactly "
-                        f"how a real GO on rate/occupancy can still end up a poor investment. Consider trimming "
-                        f"scope, phasing the build, or extending the target payback period if {implied_years:.1f} "
-                        f"years is still acceptable."
-                    )
-                else:
-                    st.success(
-                        f"**✅ Planned budget is within the affordable ceiling** — {fmt_myr(budget_delta)} of "
-                        f"headroom remaining at the {payback_years:.0f}-year payback target."
-                    )
-
-        st.divider()
-
-        # ── ALERTS & RECOMMENDATIONS ─────────────────────────────────────────
-        st.markdown("#### 🔔 Alerts & Recommendations")
-        alerts = []
-
-        latest = tdf.iloc[-1]
-        prior3 = tdf.iloc[-4:-1] if len(tdf) >= 4 else tdf.iloc[:-1]
-
-        # ADR vs current target range (editable above)
-        if latest["adr"] > 0:
-            if latest["adr"] < adr_target_min:
-                alerts.append(("warning",
-                    f"**ADR below target** — {latest['label']} averaged **RM{latest['adr']:,.0f}/night**, "
-                    f"under the RM{adr_target_min:,.0f}–{adr_target_max:,.0f} target. If this is expected "
-                    f"(e.g. refresh not yet live), no action needed — otherwise worth checking rates are "
-                    f"actually updated on all channels."))
-            else:
-                alerts.append(("success",
-                    f"**ADR on target** — {latest['label']} averaged **RM{latest['adr']:,.0f}/night**, "
-                    f"within the RM{adr_target_min:,.0f}–{adr_target_max:,.0f} target range."))
-
-        # Occupancy vs configurable gate
-        if pd.notna(latest["occupancy_pct"]):
-            if latest["occupancy_pct"] < occupancy_gate:
-                alerts.append(("warning",
-                    f"**Occupancy below gate** — {latest['label']} occupancy was "
-                    f"**{latest['occupancy_pct']:.0f}%**, below the {occupancy_gate:.0f}% threshold. "
-                    f"Keep watching this through peak season (Nov–Feb)."))
-            else:
-                alerts.append(("success",
-                    f"**Occupancy clearing the gate** — {latest['label']} occupancy was "
-                    f"**{latest['occupancy_pct']:.0f}%**, at or above the {occupancy_gate:.0f}% threshold."))
-
-        # Net margin trend — declining over last 3 months vs prior
-        if len(prior3) >= 2:
-            avg_prior_margin = prior3["net_margin_pct"].mean()
-            if latest["net_margin_pct"] < avg_prior_margin - 5:
-                alerts.append(("warning",
-                    f"**Margin slipping** — net margin was **{latest['net_margin_pct']:.0f}%** in "
-                    f"{latest['label']}, down from a ~{avg_prior_margin:.0f}% average over the prior months. "
-                    f"Worth checking OpEx Breakdown for a cost spike this period."))
-
-        if not alerts:
-            st.success("No issues flagged this period — ADR, occupancy, and margins all look on track.")
-        else:
-            for kind, msg in alerts:
-                (st.warning if kind == "warning" else st.success)(msg)
-
-        st.divider()
-
-        # ── ADR TREND ─────────────────────────────────────────────────────────
-        st.markdown("#### Average Daily Rate (ADR) Trend")
-        st.caption(f"Gross income ÷ nights sold, by month. Current target: "
-                   f"RM{adr_target_min:,.0f}–{adr_target_max:,.0f} (adjustable above).")
-
-        recent3 = tdf.tail(3)
-        recent3_gross = recent3["gross_income"].sum()
-        recent3_nights = recent3["nights"].sum()
-        recent3_adr = (recent3_gross / recent3_nights) if recent3_nights else 0
-
-        recent12 = tdf.tail(12)
-        recent12_gross = recent12["gross_income"].sum()
-        recent12_nights = recent12["nights"].sum()
-        recent12_adr = (recent12_gross / recent12_nights) if recent12_nights else 0
-
-        alltime_gross = tdf["gross_income"].sum()
-        alltime_nights = tdf["nights"].sum()
-        alltime_adr = (alltime_gross / alltime_nights) if alltime_nights else 0
-
-        radr1, radr2, radr3 = st.columns(3)
-        radr1.metric(f"Recent 3-Month ADR", f"RM {recent3_adr:,.0f}",
-                     delta=f"{recent3_adr - alltime_adr:+,.0f} vs all-time",
-                     help=f"{', '.join(recent3['label'])}. Weighted by actual nights sold. "
-                          "Shows the most current pricing performance.")
-        radr2.metric(f"Latest 12-Month ADR", f"RM {recent12_adr:,.0f}",
-                     delta=f"{recent12_adr - alltime_adr:+,.0f} vs all-time",
-                     help=f"Trailing 12 months ({recent12['label'].iloc[0]} to {recent12['label'].iloc[-1]}). "
-                          "The right figure for Go/No-Go and competitor comparisons — recent enough to reflect "
-                          "current pricing, stable enough to smooth out single-month noise.")
-        radr3.metric("All-Time ADR", f"RM {alltime_adr:,.0f}",
-                     help="Blended across your full booking history since operations began — includes "
-                          "bookings made before rate revisions. Useful for long-term context only.")
-
-        adr_chart_df = tdf.set_index("label")[["adr"]].rename(columns={"adr": "ADR (RM/night)"})
-        st.line_chart(adr_chart_df)
-
-        st.divider()
-
-        # ── OCCUPANCY TREND ──────────────────────────────────────────────────
-        st.markdown("#### Occupancy % Trend")
-        st.caption(f"From each month's manager report. Current gate: {occupancy_gate:.0f}%+ occupancy "
-                   f"(adjustable above).")
-        occ_chart_df = tdf.dropna(subset=["occupancy_pct"]).set_index("label")[["occupancy_pct"]].rename(
-            columns={"occupancy_pct": "Occupancy %"})
-        if not occ_chart_df.empty:
-            st.line_chart(occ_chart_df)
-        else:
-            st.caption("No occupancy data yet — this comes from the Manager's Monthly Report scan.")
-
-        st.divider()
-
-        # ── NET MARGIN TREND ─────────────────────────────────────────────────
-        st.markdown("#### Net Margin % Trend")
-        st.caption("Owner net profit ÷ gross income, by month. Shows whether profitability is improving "
-                   "or just revenue is growing while costs eat into it.")
-        margin_chart_df = tdf.set_index("label")[["net_margin_pct"]].rename(columns={"net_margin_pct": "Net Margin %"})
-        st.line_chart(margin_chart_df)
-
-        st.divider()
-
-        # ── COMPETITOR WATCHLIST & RATE TRACKER ──────────────────────────────
-        COMPETITOR_TYPOLOGIES = [
-            "Paddy Field / Countryside Villa",
-            "Hillside / Jungle Villa",
-            "Beachfront Villa",
-            "Boutique Resort",
-            "Other",
-        ]
-        ULU1_TYPOLOGY = "Paddy Field / Countryside Villa"
-
-        st.markdown("#### Competitor Rate Tracker")
-        st.caption("A curated watchlist rather than random checks — matched to ULU 1's actual positioning "
-                   "(paddy field/countryside, couples/design-focused), not beachfront or family resorts "
-                   "that aren't real competitors for the same guest search.")
-
-        with st.expander("📋 Manage Competitor Watchlist"):
-            with st.form("add_watchlist_competitor", clear_on_submit=True):
-                wc1, wc2 = st.columns(2)
-                wl_name = wc1.text_input("Competitor Name", placeholder="e.g. [property name]")
-                wl_typology = wc2.selectbox("Typology", COMPETITOR_TYPOLOGIES,
-                    help=f"ULU 1 is a {ULU1_TYPOLOGY} — only same-typology properties are real competitors "
-                         f"for the same guest search. Others are useful as ceiling/floor references only.")
-                wl_location = st.text_input("Location", placeholder="e.g. Padang Matsirat, Langkawi")
-                wl_notes = st.text_input("Notes (optional)", placeholder="e.g. similar bedroom count, price tier reference")
-                if st.form_submit_button("➕ Add to Watchlist", use_container_width=True):
-                    if not wl_name:
-                        st.error("Competitor name is required.")
-                    else:
-                        conn = get_db()
-                        conn.execute(
-                            "INSERT INTO competitor_watchlist (name,typology,location,notes,active,added_date) VALUES (?,?,?,?,?,?)",
-                            (wl_name, wl_typology, wl_location, wl_notes, 1, datetime.date.today().isoformat())
-                        )
-                        conn.commit(); conn.close()
-                        st.success(f"Added {wl_name} to the watchlist.")
-                        st.rerun()
-
-            conn = get_db()
-            watchlist_rows = conn.execute("SELECT * FROM competitor_watchlist ORDER BY typology, name", ()).fetchall()
-            conn.close()
-            watchlist = [dict(r) for r in watchlist_rows if r.get("active", 1)]
-
-            if watchlist:
-                st.markdown("**Current watchlist:** (edit the name once you know the exact villa name, then Save)")
-                for w in watchlist:
-                    wcol1, wcol2, wcol3 = st.columns([4, 1.2, 1])
-                    match_tag = "✓ same typology" if w["typology"] == ULU1_TYPOLOGY else "reference only"
-                    new_name = wcol1.text_input(
-                        f"Name — {w['typology']} ({match_tag}) — {w.get('location','') or '—'}",
-                        value=w["name"], key=f"wl_name_{w['id']}"
-                    )
-                    if wcol2.button("💾 Save", key=f"wl_save_{w['id']}"):
-                        if new_name.strip() and new_name.strip() != w["name"]:
-                            conn = get_db()
-                            old_name = w["name"]
-                            conn.execute("UPDATE competitor_watchlist SET name=? WHERE id=?",
-                                         (new_name.strip(), w["id"]))
-                            # Keep historical rate checks linked — they're matched by name string, not id.
-                            conn.execute("UPDATE competitor_rates SET competitor_name=? WHERE competitor_name=?",
-                                         (new_name.strip(), old_name))
-                            conn.commit(); conn.close()
-                            st.success(f"Renamed to {new_name.strip()} — rate history carried over.")
-                            st.rerun()
-                    if wcol3.button("Remove", key=f"wl_del_{w['id']}"):
-                        conn = get_db()
-                        conn.execute("UPDATE competitor_watchlist SET active=0 WHERE id=?", (w["id"],))
-                        conn.commit(); conn.close()
-                        st.rerun()
-            else:
-                st.info(f"Watchlist is empty. Add properties that are genuinely comparable to ULU 1 — "
-                        f"same typology ({ULU1_TYPOLOGY}), similar guest search intent. A beachfront or "
-                        f"family resort won't be competing for the same booking, even if it's nearby.")
-
-        # ── Quarterly due-for-check alert ─────────────────────────────────────
-        if watchlist:
-            today = datetime.date.today()
-            due_for_check = []
-            for w in watchlist:
-                last_checked = w.get("last_checked_date")
-                if not last_checked:
-                    due_for_check.append(w["name"])
-                else:
-                    try:
-                        lc_date = datetime.date.fromisoformat(last_checked)
-                        if (today - lc_date).days >= 90:
-                            due_for_check.append(w["name"])
-                    except Exception:
-                        due_for_check.append(w["name"])
-            if due_for_check:
-                st.warning(f"📌 **Due for quarterly rate check:** {', '.join(due_for_check)}")
-
-        with st.expander("➕ Log a Competitor Rate Check"):
-            if not watchlist:
-                st.caption("Add at least one competitor to the watchlist above first.")
-            else:
-                with st.form("add_competitor_rate", clear_on_submit=True):
-                    watchlist_names = [w["name"] for w in watchlist]
-                    cr1, cr2 = st.columns(2)
-                    cr_name = cr1.selectbox("Competitor", watchlist_names)
-                    cr_date = cr2.text_input("Date Checked (YYYY-MM-DD)", value=datetime.date.today().isoformat())
-                    cr3, cr4 = st.columns(2)
-                    cr_rate = cr3.number_input("Rate Seen (RM/night)", min_value=0.0, step=10.0, format="%.2f")
-                    cr_source = cr4.selectbox("Source", ["Airbnb","Booking.com","Direct website","Other"])
-                    cr_notes = st.text_input("Notes (optional)", placeholder="e.g. weekday rate, low-season, 2BR")
-                    if st.form_submit_button("💾 Save Rate Check", use_container_width=True):
-                        if not cr_name or cr_rate <= 0:
-                            st.error("Competitor and rate are required.")
-                        else:
-                            conn = get_db()
-                            conn.execute(
-                                "INSERT INTO competitor_rates (date_checked,competitor_name,rate_rm,source,notes) VALUES (?,?,?,?,?)",
-                                (cr_date, cr_name, cr_rate, cr_source, cr_notes)
-                            )
-                            conn.execute(
-                                "UPDATE competitor_watchlist SET last_checked_date=? WHERE name=?",
-                                (cr_date, cr_name)
-                            )
-                            conn.commit(); conn.close()
-                            _build_trend_dataframe.clear()
-                            st.success("Saved.")
-                            st.rerun()
-
-        conn = get_db()
-        comp_rows = conn.execute("SELECT * FROM competitor_rates ORDER BY date_checked DESC", ()).fetchall()
-        conn.close()
-
-        if not comp_rows:
-            st.info("No competitor rate checks logged yet.")
-        else:
-            comp_df = pd.DataFrame([dict(r) for r in comp_rows])
-            watchlist_by_name = {w["name"]: w["typology"] for w in watchlist} if watchlist else {}
-            comp_df["typology"] = comp_df["competitor_name"].map(watchlist_by_name)
-            same_typology_df = comp_df[comp_df["typology"] == ULU1_TYPOLOGY]
-
-            benchmark_df = same_typology_df if not same_typology_df.empty else comp_df
-            latest_comp_avg = benchmark_df.sort_values("date_checked", ascending=False).head(5)["rate_rm"].astype(float).mean()
-
-            mc1, mc2, mc3 = st.columns(3)
-            mc1.metric("ULU 1's Latest 12-Month ADR", f"RM {recent12_adr:,.0f}",
-                       help="Trailing 12 months, not a single month or all-time — matches the ~4-month "
-                            "competitor rate refresh cadence better than a legacy blended figure.")
-            mc2.metric("Same-Typology Competitor Avg (last 5 checks)", f"RM {latest_comp_avg:,.0f}")
-            delta_pct = ((recent12_adr - latest_comp_avg) / latest_comp_avg * 100) if latest_comp_avg else 0
-            mc3.metric("ULU 1 vs Competitors", f"{delta_pct:+.0f}%",
-                       help="Positive = ULU 1 priced above the same-typology competitor average. "
-                            "Beachfront/resort properties are excluded from this benchmark.")
-
-            st.markdown("**Rate check log:**")
-            display_comp = comp_df.copy()
-            display_comp["rate_rm"] = display_comp["rate_rm"].apply(lambda x: fmt_myr(x))
-            display_comp = display_comp[["date_checked","competitor_name","typology","rate_rm","source","notes"]]
-            display_comp.columns = ["Date","Competitor","Typology","Rate","Source","Notes"]
-            st.dataframe(display_comp, use_container_width=True, hide_index=True)
-
-        st.divider()
-
-        # ── SEASONALITY: SAME MONTH YEAR-OVER-YEAR ──────────────────────────
-        st.markdown("#### Seasonality — Same Month, Year-over-Year")
-        st.caption("Compare this month's performance against the same month last year, to separate "
-                   "genuine trend from normal seasonal swings.")
-        pivot_df = tdf.pivot_table(index="month", columns="year", values="gross_income", aggfunc="sum")
-        pivot_df.index = [MONTHS[m-1] for m in pivot_df.index]
-        pivot_df = pivot_df.reindex(MONTHS).dropna(how="all")
-        if not pivot_df.empty:
-            display_pivot = pivot_df.copy()
-            for col in display_pivot.columns:
-                display_pivot[col] = display_pivot[col].apply(lambda x: fmt_myr(x) if pd.notna(x) else "—")
-            st.dataframe(display_pivot, use_container_width=True)
-        else:
-            st.caption("Not enough years of data yet for a year-over-year comparison.")
-
-    st.markdown('</div>', unsafe_allow_html=True)
