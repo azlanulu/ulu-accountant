@@ -3894,9 +3894,18 @@ with tab11:
 
         # ── DETECT PEAK SEASON FROM HISTORY ──────────────────────────────────
         with st.expander("📅 Detect Peak Season from History"):
-            years_of_data = tdf["year"].nunique()
-            st.caption(f"Average occupancy by calendar month, across {years_of_data} year(s) of data on file. "
+            occ_df_only = tdf.dropna(subset=["occupancy_pct"])
+            years_of_data = occ_df_only["year"].nunique()  # years with ACTUAL occupancy scans, not just bookings
+            months_with_data = sorted(occ_df_only["month"].unique().tolist())
+            missing_months = [MONTHS[m-1] for m in range(1,13) if m not in months_with_data]
+
+            st.caption(f"Average occupancy by calendar month, across {years_of_data} year(s) of actual "
+                       f"manager-report scans on file. "
                        f"{'⚠️ Limited reliability with under 2 years of history — treat as a rough signal, not a confident pattern.' if years_of_data < 2 else 'Based on enough history to be a reasonable signal.'}")
+            if missing_months:
+                st.warning(f"⚠️ **No data at all for: {', '.join(missing_months)}** — these months have never "
+                           f"been scanned in any year. The chart below can't say anything about them, and any "
+                           f"'peak season' conclusion is only as good as the months actually covered.")
 
             occ_by_cal_month = tdf.dropna(subset=["occupancy_pct"]).groupby("month")["occupancy_pct"].mean()
             if occ_by_cal_month.empty:
@@ -4193,17 +4202,21 @@ with tab11:
         # ── COMPETITOR WATCHLIST & RATE TRACKER ──────────────────────────────
         COMPETITOR_TYPOLOGIES = [
             "Paddy Field / Countryside Villa",
+            "Garden / Semi-Paddy Villa",
             "Hillside / Jungle Villa",
             "Beachfront Villa",
             "Boutique Resort",
             "Other",
         ]
+        PRICING_TYPES = ["Per Room", "Whole Villa"]
+        ARRANGEMENT_TYPES = ["Private", "Compound (shared with other villas)"]
         ULU1_TYPOLOGY = "Paddy Field / Countryside Villa"
+        ULU1_MAX_GUESTS = 4  # for RM/guest normalization — update if ULU 1's capacity changes
 
         st.markdown("#### Competitor Rate Tracker")
-        st.caption("A curated watchlist rather than random checks — matched to ULU 1's actual positioning "
-                   "(paddy field/countryside, couples/design-focused), not beachfront or family resorts "
-                   "that aren't real competitors for the same guest search.")
+        st.caption("A curated watchlist matched to ULU 1's actual positioning (paddy field/countryside, "
+                   "couples/design-focused). Sister properties are grouped separately and benchmarked first, "
+                   "since they're the cleanest apples-to-apples comparison.")
 
         with st.expander("📋 Manage Competitor Watchlist"):
             with st.form("add_watchlist_competitor", clear_on_submit=True):
@@ -4212,16 +4225,34 @@ with tab11:
                 wl_typology = wc2.selectbox("Typology", COMPETITOR_TYPOLOGIES,
                     help=f"ULU 1 is a {ULU1_TYPOLOGY} — only same-typology properties are real competitors "
                          f"for the same guest search. Others are useful as ceiling/floor references only.")
-                wl_location = st.text_input("Location", placeholder="e.g. Padang Matsirat, Langkawi")
-                wl_notes = st.text_input("Notes (optional)", placeholder="e.g. similar bedroom count, price tier reference")
+                wc3, wc4, wc5 = st.columns(3)
+                wl_guests = wc3.number_input("Guests Allowed", min_value=1, step=1, value=4)
+                wl_bedrooms = wc4.number_input("Bedrooms", min_value=1, step=1, value=2)
+                wl_bathrooms = wc5.number_input("Bathrooms", min_value=0.5, step=0.5, value=2.0)
+                wc6, wc7, wc8 = st.columns(3)
+                wl_pool = wc6.selectbox("Private Pool", ["Y", "N"])
+                wl_pricing_type = wc7.selectbox("Pricing Type", PRICING_TYPES,
+                    help="Per Room rates aren't directly comparable to Whole Villa rates without normalization.")
+                wl_arrangement = wc8.selectbox("Arrangement", ARRANGEMENT_TYPES)
+                wc9, wc10 = st.columns(2)
+                wl_location = wc9.text_input("Location / Distance", placeholder="e.g. 2.6km from ULU 1")
+                wl_is_sister = wc10.checkbox("Sister property (same management company)")
+                wl_is_primary = st.checkbox("⭐ Primary Benchmark (pin to top — usually just one, e.g. the closest same-capacity sister property)")
+                wl_notes = st.text_input("Notes (optional)", placeholder="e.g. shares compound with 3 other villas, no pool")
                 if st.form_submit_button("➕ Add to Watchlist", use_container_width=True):
                     if not wl_name:
                         st.error("Competitor name is required.")
                     else:
                         conn = get_db()
                         conn.execute(
-                            "INSERT INTO competitor_watchlist (name,typology,location,notes,active,added_date) VALUES (?,?,?,?,?,?)",
-                            (wl_name, wl_typology, wl_location, wl_notes, 1, datetime.date.today().isoformat())
+                            """INSERT INTO competitor_watchlist
+                               (name,typology,location,notes,active,added_date,is_sister_property,
+                                is_primary_benchmark,private_pool,guests_allowed,bedrooms,bathrooms,
+                                pricing_type,villa_arrangement)
+                               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                            (wl_name, wl_typology, wl_location, wl_notes, 1, datetime.date.today().isoformat(),
+                             1 if wl_is_sister else 0, 1 if wl_is_primary else 0, wl_pool,
+                             wl_guests, wl_bedrooms, wl_bathrooms, wl_pricing_type, wl_arrangement)
                         )
                         conn.commit(); conn.close()
                         st.success(f"Added {wl_name} to the watchlist.")
@@ -4231,39 +4262,57 @@ with tab11:
             watchlist_rows = conn.execute("SELECT * FROM competitor_watchlist ORDER BY typology, name", ()).fetchall()
             conn.close()
             watchlist = [dict(r) for r in watchlist_rows if r.get("active", 1)]
+            sister_props = [w for w in watchlist if w.get("is_sister_property")]
+            other_comps = [w for w in watchlist if not w.get("is_sister_property")]
+            # Primary benchmark pinned first within sisters
+            sister_props.sort(key=lambda w: (not w.get("is_primary_benchmark"), w["name"]))
 
-            if watchlist:
-                st.markdown("**Current watchlist:** (edit the name once you know the exact villa name, then Save)")
-                for w in watchlist:
-                    wcol1, wcol2, wcol3 = st.columns([4, 1.2, 1])
-                    match_tag = "✓ same typology" if w["typology"] == ULU1_TYPOLOGY else "reference only"
-                    new_name = wcol1.text_input(
-                        f"Name — {w['typology']} ({match_tag}) — {w.get('location','') or '—'}",
-                        value=w["name"], key=f"wl_name_{w['id']}"
-                    )
-                    if wcol2.button("💾 Save", key=f"wl_save_{w['id']}"):
-                        if new_name.strip() and new_name.strip() != w["name"]:
-                            conn = get_db()
-                            old_name = w["name"]
-                            conn.execute("UPDATE competitor_watchlist SET name=? WHERE id=?",
-                                         (new_name.strip(), w["id"]))
-                            # Keep historical rate checks linked — they're matched by name string, not id.
-                            conn.execute("UPDATE competitor_rates SET competitor_name=? WHERE competitor_name=?",
-                                         (new_name.strip(), old_name))
-                            conn.commit(); conn.close()
-                            st.success(f"Renamed to {new_name.strip()} — rate history carried over.")
-                            st.rerun()
-                    if wcol3.button("Remove", key=f"wl_del_{w['id']}"):
+            def _render_watchlist_row(w):
+                wcol1, wcol2, wcol3 = st.columns([4, 1.2, 1])
+                match_tag = "✓ same typology" if w["typology"] == ULU1_TYPOLOGY else "reference only"
+                benchmark_tag = " ⭐ PRIMARY BENCHMARK" if w.get("is_primary_benchmark") else ""
+                detail_bits = []
+                if w.get("guests_allowed"): detail_bits.append(f"{int(w['guests_allowed'])} guests")
+                if w.get("pricing_type"): detail_bits.append(w["pricing_type"])
+                if w.get("private_pool"): detail_bits.append("Pool" if w["private_pool"]=="Y" else "No pool")
+                if w.get("villa_arrangement"): detail_bits.append(w["villa_arrangement"].split(" ")[0])
+                detail_str = " · ".join(detail_bits)
+                new_name = wcol1.text_input(
+                    f"{w['typology']} ({match_tag}){benchmark_tag} — {detail_str} — {w.get('location','') or '—'}",
+                    value=w["name"], key=f"wl_name_{w['id']}"
+                )
+                if wcol2.button("💾 Save", key=f"wl_save_{w['id']}"):
+                    if new_name.strip() and new_name.strip() != w["name"]:
                         conn = get_db()
-                        conn.execute("UPDATE competitor_watchlist SET active=0 WHERE id=?", (w["id"],))
+                        old_name = w["name"]
+                        conn.execute("UPDATE competitor_watchlist SET name=? WHERE id=?",
+                                     (new_name.strip(), w["id"]))
+                        conn.execute("UPDATE competitor_rates SET competitor_name=? WHERE competitor_name=?",
+                                     (new_name.strip(), old_name))
                         conn.commit(); conn.close()
+                        st.success(f"Renamed to {new_name.strip()} — rate history carried over.")
                         st.rerun()
-            else:
+                if wcol3.button("Remove", key=f"wl_del_{w['id']}"):
+                    conn = get_db()
+                    conn.execute("UPDATE competitor_watchlist SET active=0 WHERE id=?", (w["id"],))
+                    conn.commit(); conn.close()
+                    st.rerun()
+
+            if sister_props:
+                st.markdown("**🏠 Sister Properties (Same Management Company):**")
+                for w in sister_props:
+                    _render_watchlist_row(w)
+                st.divider()
+            if other_comps:
+                st.markdown("**🏘️ External Market Competitors:**")
+                for w in other_comps:
+                    _render_watchlist_row(w)
+            if not watchlist:
                 st.info(f"Watchlist is empty. Add properties that are genuinely comparable to ULU 1 — "
                         f"same typology ({ULU1_TYPOLOGY}), similar guest search intent. A beachfront or "
                         f"family resort won't be competing for the same booking, even if it's nearby.")
 
-        # ── Quarterly due-for-check alert ─────────────────────────────────────
+        # ── 6-month due-for-check alert ─────────────────────────────────────
         if watchlist:
             today = datetime.date.today()
             due_for_check = []
@@ -4274,42 +4323,223 @@ with tab11:
                 else:
                     try:
                         lc_date = datetime.date.fromisoformat(last_checked)
-                        if (today - lc_date).days >= 90:
+                        if (today - lc_date).days >= 180:
                             due_for_check.append(w["name"])
                     except Exception:
                         due_for_check.append(w["name"])
             if due_for_check:
-                st.warning(f"📌 **Due for quarterly rate check:** {', '.join(due_for_check)}")
+                st.warning(f"📌 **Due for 6-month rate check:** {', '.join(due_for_check)}")
+
+        with st.expander("📤 Upload Competitor CSV (6-month refresh)"):
+            st.caption("Upload the same tracking spreadsheet template each refresh cycle — columns: "
+                       "No, Name, Picture Ref, Rating, Bedrooms, Bath, Guests, Private Pool, Distance, "
+                       "View, Pricing Type, Arrangement, then quarterly rate columns. Row 1 (ULU Mahsuri "
+                       "itself) is skipped automatically.")
+            comp_csv = st.file_uploader("Upload competitor tracking CSV", type=["csv"], key="comp_csv_upload")
+
+            if comp_csv:
+                try:
+                    comp_upload_df = pd.read_csv(comp_csv)
+                    comp_upload_df.columns = [str(c).strip() for c in comp_upload_df.columns]
+                    period_cols = list(comp_upload_df.columns[12:28])  # quarterly rate columns, by position
+
+                    conn = get_db()
+                    existing_wl = conn.execute("SELECT * FROM competitor_watchlist", ()).fetchall()
+                    conn.close()
+                    existing_by_name = {str(w["name"]).strip().upper(): w for w in existing_wl}
+
+                    matched_updates, new_competitors, rate_entries = [], [], []
+
+                    for _, row in comp_upload_df.iterrows():
+                        no = str(row.iloc[0]).strip()
+                        if no == "1" or no == "" or no.lower() == "nan":
+                            continue  # skip ULU Mahsuri's own row / blank rows
+                        name = str(row.iloc[1]).strip()
+                        if not name or name.lower() == "nan":
+                            continue
+
+                        rating = row.iloc[3] if len(row) > 3 else None
+                        bedrooms = row.iloc[4] if len(row) > 4 else None
+                        bathrooms = row.iloc[5] if len(row) > 5 else None
+                        guests = row.iloc[6] if len(row) > 6 else None
+                        pool = str(row.iloc[7]).strip() if len(row) > 7 else None
+                        distance = str(row.iloc[8]).strip() if len(row) > 8 else ""
+                        view = str(row.iloc[9]).strip() if len(row) > 9 else ""
+                        ptype_raw = str(row.iloc[10]).strip() if len(row) > 10 else ""
+                        arrangement_raw = str(row.iloc[11]).strip() if len(row) > 11 else ""
+
+                        typology_guess = "Other"
+                        if "paddy" in view.lower(): typology_guess = "Paddy Field / Countryside Villa"
+                        elif "garden" in view.lower() or "semi" in view.lower(): typology_guess = "Garden / Semi-Paddy Villa"
+                        elif "hill" in view.lower(): typology_guess = "Hillside / Jungle Villa"
+                        pricing_type_guess = "Per Room" if "room" in ptype_raw.lower() else "Whole Villa"
+                        arrangement_guess = "Compound (shared with other villas)" if "compound" in arrangement_raw.lower() else "Private"
+
+                        key = name.upper()
+                        row_rates = []
+                        for pc in period_cols:
+                            val = row.get(pc)
+                            if pd.notna(val) and str(val).strip() not in ("", "N/A"):
+                                try:
+                                    row_rates.append((pc, float(val)))
+                                except (ValueError, TypeError):
+                                    pass
+
+                        if key in existing_by_name:
+                            matched_updates.append({
+                                "id": existing_by_name[key]["id"], "name": existing_by_name[key]["name"],
+                                "typology": typology_guess, "location": distance, "guests": guests,
+                                "bedrooms": bedrooms, "bathrooms": bathrooms, "pool": pool,
+                                "pricing_type": pricing_type_guess, "arrangement": arrangement_guess,
+                                "rates": row_rates
+                            })
+                        else:
+                            new_competitors.append({
+                                "name": name, "typology": typology_guess, "location": distance,
+                                "guests": guests, "bedrooms": bedrooms, "bathrooms": bathrooms,
+                                "pool": pool, "pricing_type": pricing_type_guess,
+                                "arrangement": arrangement_guess, "rates": row_rates
+                            })
+
+                    st.success(f"✓ Parsed {len(matched_updates)} existing competitor(s) to update, "
+                               f"{len(new_competitors)} new competitor(s) found.")
+
+                    if matched_updates:
+                        st.markdown(f"**Will update details + add rate checks for:** " +
+                                    ", ".join(m["name"] for m in matched_updates))
+
+                    new_selected = []
+                    if new_competitors:
+                        st.markdown("**New competitors found — select which to add:**")
+                        for i, nc in enumerate(new_competitors):
+                            if st.checkbox(f"{nc['name']} ({nc['typology']}, {nc['guests']} guests)",
+                                           value=True, key=f"new_comp_{i}"):
+                                new_selected.append(nc)
+
+                    if st.button("💾 Apply Update", type="primary", key="btn_apply_comp_csv"):
+                        conn = get_db()
+                        today = datetime.date.today().isoformat()
+                        updated_count, rate_count = 0, 0
+
+                        for m in matched_updates:
+                            conn.execute(
+                                """UPDATE competitor_watchlist SET typology=?, location=?, guests_allowed=?,
+                                   bedrooms=?, bathrooms=?, private_pool=?, pricing_type=?, villa_arrangement=?,
+                                   last_checked_date=? WHERE id=?""",
+                                (m["typology"], m["location"], m["guests"], m["bedrooms"], m["bathrooms"],
+                                 m["pool"], m["pricing_type"], m["arrangement"], today, m["id"])
+                            )
+                            updated_count += 1
+                            for period_label, rate in m["rates"]:
+                                existing_rate = conn.execute(
+                                    "SELECT id FROM competitor_rates WHERE competitor_name=? AND period_label=?",
+                                    (m["name"], period_label)
+                                ).fetchone()
+                                if existing_rate:
+                                    conn.execute("UPDATE competitor_rates SET rate_rm=?, date_checked=? WHERE id=?",
+                                                 (rate, today, existing_rate["id"]))
+                                else:
+                                    conn.execute(
+                                        """INSERT INTO competitor_rates
+                                           (date_checked,competitor_name,rate_rm,source,notes,period_label,flagged_outlier)
+                                           VALUES (?,?,?,?,?,?,?)""",
+                                        (today, m["name"], rate, "Airbnb", "", period_label, 0)
+                                    )
+                                rate_count += 1
+
+                        for nc in new_selected:
+                            conn.execute(
+                                """INSERT INTO competitor_watchlist
+                                   (name,typology,location,notes,active,added_date,is_sister_property,
+                                    is_primary_benchmark,private_pool,guests_allowed,bedrooms,bathrooms,
+                                    pricing_type,villa_arrangement,last_checked_date)
+                                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                (nc["name"], nc["typology"], nc["location"], "Added via CSV upload", 1, today,
+                                 0, 0, nc["pool"], nc["guests"], nc["bedrooms"], nc["bathrooms"],
+                                 nc["pricing_type"], nc["arrangement"], today)
+                            )
+                            for period_label, rate in nc["rates"]:
+                                conn.execute(
+                                    """INSERT INTO competitor_rates
+                                       (date_checked,competitor_name,rate_rm,source,notes,period_label,flagged_outlier)
+                                       VALUES (?,?,?,?,?,?,?)""",
+                                    (today, nc["name"], rate, "Airbnb", "", period_label, 0)
+                                )
+                                rate_count += 1
+
+                        conn.commit(); conn.close()
+                        _build_trend_dataframe.clear()
+                        st.success(f"✓ Updated {updated_count} competitor(s), added {len(new_selected)} new, "
+                                   f"logged {rate_count} rate entries.")
+                        st.rerun()
+
+                except Exception as e:
+                    st.error(f"Couldn't parse this CSV: {e}")
+                    st.caption("Check that column order matches the template — position matters more than exact header text.")
 
         with st.expander("➕ Log a Competitor Rate Check"):
             if not watchlist:
                 st.caption("Add at least one competitor to the watchlist above first.")
             else:
+                watchlist_names = [w["name"] for w in sister_props] + [w["name"] for w in other_comps]
+                cr_name_select = st.selectbox("Competitor", watchlist_names, key="cr_name_live")
+
+                # Live outlier hint — outside the form so it reacts immediately to the dropdown
+                conn = get_db()
+                prior_rows = conn.execute(
+                    "SELECT * FROM competitor_rates WHERE competitor_name=? AND flagged_outlier=0 ORDER BY date_checked DESC",
+                    (cr_name_select,)
+                ).fetchall()
+                conn.close()
+                prior_vals = [float(r["rate_rm"]) for r in prior_rows[:3] if r.get("rate_rm")]
+                trailing_avg = sum(prior_vals)/len(prior_vals) if prior_vals else None
+                if trailing_avg:
+                    st.caption(f"Trailing average for {cr_name_select} (last {len(prior_vals)} non-outlier checks): "
+                               f"RM{trailing_avg:,.0f}/night")
+
                 with st.form("add_competitor_rate", clear_on_submit=True):
-                    watchlist_names = [w["name"] for w in watchlist]
                     cr1, cr2 = st.columns(2)
-                    cr_name = cr1.selectbox("Competitor", watchlist_names)
+                    cr_period = cr1.text_input("Period Label", placeholder="e.g. Dec26 Q2 (Xmas)",
+                        help="Matches your quarterly tracking cadence — e.g. 'Sep26 Q1', 'Apr27 Q2 (LIMA)'.")
                     cr_date = cr2.text_input("Date Checked (YYYY-MM-DD)", value=datetime.date.today().isoformat())
                     cr3, cr4 = st.columns(2)
                     cr_rate = cr3.number_input("Rate Seen (RM/night)", min_value=0.0, step=10.0, format="%.2f")
                     cr_source = cr4.selectbox("Source", ["Airbnb","Booking.com","Direct website","Other"])
                     cr_notes = st.text_input("Notes (optional)", placeholder="e.g. weekday rate, low-season, 2BR")
+                    cr_flag = st.checkbox("🚩 Flag as legacy/outlier (excluded from averages)",
+                        help="Tick this for pre-revision bookings, one-off promos, or anything that would "
+                             "skew the trend if included.")
+                    cr_flag_reason = st.text_input("Outlier reason (if flagged)", placeholder="e.g. pre-revision legacy rate")
                     if st.form_submit_button("💾 Save Rate Check", use_container_width=True):
-                        if not cr_name or cr_rate <= 0:
+                        if not cr_name_select or cr_rate <= 0:
                             st.error("Competitor and rate are required.")
                         else:
+                            auto_flag = cr_flag
+                            if not auto_flag and trailing_avg and trailing_avg > 0:
+                                deviation = abs(cr_rate - trailing_avg) / trailing_avg
+                                if deviation > 0.30:
+                                    auto_flag = True
+                                    if not cr_flag_reason:
+                                        cr_flag_reason = f"Auto-flagged: {deviation*100:.0f}% deviation from trailing average — review and confirm."
                             conn = get_db()
                             conn.execute(
-                                "INSERT INTO competitor_rates (date_checked,competitor_name,rate_rm,source,notes) VALUES (?,?,?,?,?)",
-                                (cr_date, cr_name, cr_rate, cr_source, cr_notes)
+                                """INSERT INTO competitor_rates
+                                   (date_checked,competitor_name,rate_rm,source,notes,period_label,
+                                    flagged_outlier,outlier_reason)
+                                   VALUES (?,?,?,?,?,?,?,?)""",
+                                (cr_date, cr_name_select, cr_rate, cr_source, cr_notes, cr_period,
+                                 1 if auto_flag else 0, cr_flag_reason)
                             )
                             conn.execute(
                                 "UPDATE competitor_watchlist SET last_checked_date=? WHERE name=?",
-                                (cr_date, cr_name)
+                                (cr_date, cr_name_select)
                             )
                             conn.commit(); conn.close()
                             _build_trend_dataframe.clear()
-                            st.success("Saved.")
+                            if auto_flag:
+                                st.warning(f"Saved — flagged as outlier ({cr_flag_reason})")
+                            else:
+                                st.success("Saved.")
                             st.rerun()
 
         conn = get_db()
@@ -4320,28 +4550,86 @@ with tab11:
             st.info("No competitor rate checks logged yet.")
         else:
             comp_df = pd.DataFrame([dict(r) for r in comp_rows])
-            watchlist_by_name = {w["name"]: w["typology"] for w in watchlist} if watchlist else {}
-            comp_df["typology"] = comp_df["competitor_name"].map(watchlist_by_name)
-            same_typology_df = comp_df[comp_df["typology"] == ULU1_TYPOLOGY]
+            watchlist_by_name = {w["name"]: w for w in watchlist} if watchlist else {}
+            comp_df["typology"] = comp_df["competitor_name"].map(lambda n: watchlist_by_name.get(n,{}).get("typology"))
+            comp_df["is_sister"] = comp_df["competitor_name"].map(lambda n: watchlist_by_name.get(n,{}).get("is_sister_property", 0))
+            comp_df["guests"] = comp_df["competitor_name"].map(lambda n: watchlist_by_name.get(n,{}).get("guests_allowed"))
+            comp_df_clean = comp_df[comp_df["flagged_outlier"] != 1] if "flagged_outlier" in comp_df.columns else comp_df
 
-            benchmark_df = same_typology_df if not same_typology_df.empty else comp_df
-            latest_comp_avg = benchmark_df.sort_values("date_checked", ascending=False).head(5)["rate_rm"].astype(float).mean()
+            # Competitor rates are listed/gross prices (what's displayed on Airbnb before host-fee
+            # deduction), but ULU 1's own ADR is built from bookings.amount — the NET payout after
+            # Airbnb's host fee. These aren't the same basis. Gross up ULU's ADR using the CONFIRMED
+            # host fee (3.24%, verified against an actual bank payout) for a fair comparison here only.
+            # A newer/higher fee has been mentioned but isn't yet confirmed via reconciled data — once
+            # finance confirms it, update CONFIRMED_HOST_FEE_PCT below.
+            CONFIRMED_HOST_FEE_PCT = 0.0324
+            recent12_adr_listed_equiv = recent12_adr / (1 - CONFIRMED_HOST_FEE_PCT)
 
+            # Primary benchmark comparison (ULU Sepi or whichever is flagged)
+            primary = next((w for w in sister_props if w.get("is_primary_benchmark")), None)
+            if primary:
+                primary_rates = comp_df_clean[comp_df_clean["competitor_name"] == primary["name"]]
+                if not primary_rates.empty:
+                    primary_avg = primary_rates["rate_rm"].astype(float).mean()
+                    pc1, pc2, pc3 = st.columns(3)
+                    pc1.metric(f"ULU 1's ADR (listed-price equivalent)", f"RM {recent12_adr_listed_equiv:,.0f}",
+                               help=f"Trailing 12-month net-payout ADR (RM{recent12_adr:,.0f}) grossed up "
+                                    f"{CONFIRMED_HOST_FEE_PCT*100:.2f}% to match competitor listed-price basis.")
+                    pc2.metric(f"⭐ {primary['name']} (Primary Benchmark)", f"RM {primary_avg:,.0f}")
+                    gap_pct = ((recent12_adr_listed_equiv - primary_avg) / primary_avg * 100) if primary_avg else 0
+                    pc3.metric("Gap to Primary Benchmark", f"{gap_pct:+.0f}%",
+                               help="Negative = ULU 1 priced below its primary sister-property benchmark.")
+                    st.divider()
+
+            same_typology_df = comp_df_clean[comp_df_clean["typology"] == ULU1_TYPOLOGY]
+            benchmark_df = same_typology_df if not same_typology_df.empty else comp_df_clean
+            # NOTE: date_checked on seeded rows represents the pricing PERIOD's calendar date
+            # (e.g. LIMA = April), not when the check was actually logged — sorting by it and
+            # taking "recent" rows was accidentally selecting the highest-season spike rates.
+            # Average across the full cycle instead, for a representative comparison.
+            latest_comp_avg = benchmark_df["rate_rm"].astype(float).mean()
+
+            st.caption(f"ℹ️ ULU 1's ADR below is grossed up to a listed-price-equivalent basis (+"
+                       f"{CONFIRMED_HOST_FEE_PCT*100:.2f}%, the confirmed current host fee) to match how "
+                       f"competitor rates were collected — apples-to-apples, per policy. This uses the "
+                       f"confirmed fee only; will update once the possible new fee rate is confirmed via "
+                       f"reconciled payout data.")
             mc1, mc2, mc3 = st.columns(3)
-            mc1.metric("ULU 1's Latest 12-Month ADR", f"RM {recent12_adr:,.0f}",
-                       help="Trailing 12 months, not a single month or all-time — matches the ~4-month "
-                            "competitor rate refresh cadence better than a legacy blended figure.")
-            mc2.metric("Same-Typology Competitor Avg (last 5 checks)", f"RM {latest_comp_avg:,.0f}")
-            delta_pct = ((recent12_adr - latest_comp_avg) / latest_comp_avg * 100) if latest_comp_avg else 0
-            mc3.metric("ULU 1 vs Competitors", f"{delta_pct:+.0f}%",
-                       help="Positive = ULU 1 priced above the same-typology competitor average. "
-                            "Beachfront/resort properties are excluded from this benchmark.")
+            mc1.metric("ULU 1's ADR (listed-price equivalent)", f"RM {recent12_adr_listed_equiv:,.0f}",
+                       help=f"Trailing 12-month net-payout ADR (RM{recent12_adr:,.0f}) grossed up to match "
+                            f"competitor listed-price basis. Matches the 6-month competitor refresh cadence.")
+            mc2.metric("Same-Typology Market Avg (full cycle, outliers excluded)", f"RM {latest_comp_avg:,.0f}")
+            delta_pct = ((recent12_adr_listed_equiv - latest_comp_avg) / latest_comp_avg * 100) if latest_comp_avg else 0
+            mc3.metric("ULU 1 vs Market", f"{delta_pct:+.0f}%",
+                       help="Positive = ULU 1 priced above the same-typology market average.")
+
+            # RM/guest normalized view — handles the Per Room vs Whole Villa mismatch
+            with st.expander("📐 RM/Guest Normalized Comparison (handles Per Room vs Whole Villa)"):
+                st.caption("Raw nightly rate isn't a fair comparison when properties sleep different guest "
+                           "counts or price per-room vs whole-villa. This divides by capacity instead.")
+                ulu_per_guest = recent12_adr / ULU1_MAX_GUESTS
+                per_guest_rows = [{"Property": "ULU Mahsuri Villa (self)", "RM/Guest": ulu_per_guest, "Guests": ULU1_MAX_GUESTS}]
+                for w in watchlist:
+                    w_rates = comp_df_clean[comp_df_clean["competitor_name"] == w["name"]]
+                    if not w_rates.empty and w.get("guests_allowed"):
+                        avg_rate = w_rates["rate_rm"].astype(float).mean()
+                        per_guest_rows.append({
+                            "Property": w["name"] + (" ⭐" if w.get("is_primary_benchmark") else ""),
+                            "RM/Guest": avg_rate / w["guests_allowed"],
+                            "Guests": int(w["guests_allowed"]),
+                        })
+                pg_df = pd.DataFrame(per_guest_rows).sort_values("RM/Guest", ascending=False)
+                pg_df["RM/Guest"] = pg_df["RM/Guest"].apply(lambda x: f"RM {x:,.0f}")
+                st.dataframe(pg_df, use_container_width=True, hide_index=True)
 
             st.markdown("**Rate check log:**")
             display_comp = comp_df.copy()
             display_comp["rate_rm"] = display_comp["rate_rm"].apply(lambda x: fmt_myr(x))
-            display_comp = display_comp[["date_checked","competitor_name","typology","rate_rm","source","notes"]]
-            display_comp.columns = ["Date","Competitor","Typology","Rate","Source","Notes"]
+            display_comp["flagged_outlier"] = display_comp.get("flagged_outlier", 0).apply(lambda x: "🚩 Yes" if x==1 else "")
+            cols_to_show = ["date_checked","competitor_name","typology","period_label","rate_rm","source","flagged_outlier","notes"]
+            cols_to_show = [c for c in cols_to_show if c in display_comp.columns]
+            display_comp = display_comp[cols_to_show]
+            display_comp.columns = ["Date","Competitor","Typology","Period","Rate","Source","Outlier?","Notes"][:len(cols_to_show)]
             st.dataframe(display_comp, use_container_width=True, hide_index=True)
 
         st.divider()
