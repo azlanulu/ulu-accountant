@@ -31,3 +31,9 @@ __pycache__/
 .venv/
 venv/
 .env
+
+secrets.toml.txt
+
+.streamlit/secrets.toml
+
+*.toml.txt
