@@ -37,3 +37,7 @@ secrets.toml.txt
 .streamlit/secrets.toml
 
 *.toml.txt
+
+ulu_accountant_*.txt
+
+*_backup_*.py
