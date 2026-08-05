@@ -3345,29 +3345,13 @@ with tab9:
                 st.session_state["pv_type"]  = rec.get("payee_type") if rec.get("payee_type") in PAYMENT_TYPES else PAYMENT_TYPES[0]
                 st.session_state["pv_bank"]  = rec.get("payee_bank","") or ""
                 st.session_state["pv_acc"]   = rec.get("payee_account","") or ""
-            # "+ New Payee" intentionally does NOT clear the fields below — it's a
-            # no-op. Force-clearing here was fighting with manual typing whenever
-            # this callback re-fired on a rerun (e.g. triggered by the payee list
-            # being rebuilt from a live query), silently wiping what was just typed.
-            # If you want a blank form, use the 🔄 Clear Form button instead.
+            elif sel == "+ New Payee":
+                for k in ["pv_payee","pv_phone","pv_bank","pv_acc"]:
+                    st.session_state[k] = ""
+                st.session_state["pv_type"] = PAYMENT_TYPES[0]
 
-        # Apply any pending "Clear Form" reset BEFORE the selectbox below is created —
-        # Streamlit forbids setting a widget's session_state key after that widget has
-        # already been instantiated in the same run, so the reset must happen here,
-        # one rerun ahead of the widgets it affects.
-        if st.session_state.get("_clear_payee_form_pending"):
-            for k in ["pv_payee","pv_phone","pv_bank","pv_acc"]:
-                st.session_state[k] = ""
-            st.session_state["pv_type"] = PAYMENT_TYPES[0]
-            st.session_state["pv_payee_select"] = "+ New Payee"
-            st.session_state["_clear_payee_form_pending"] = False
-
-        pysc1, pysc2 = st.columns([4, 1])
-        pysc1.selectbox("Select Payee (autofills details below — edit as needed, or pick '+ New Payee' and type below)",
+        st.selectbox("Select Payee (autofills details below — edit as needed)",
             payee_options, key="pv_payee_select", on_change=_apply_payee_autofill)
-        if pysc2.button("🔄 Clear Form", key="btn_clear_payee_form"):
-            st.session_state["_clear_payee_form_pending"] = True
-            st.rerun()
 
         col_a, col_b = st.columns(2, gap="large")
         with col_a:
@@ -3397,13 +3381,8 @@ with tab9:
                             key="pv_proof_upload", accept_multiple_files=True)
 
         if st.button("💾 Save Payment & Generate Voucher", type="primary", key="btn_save_pv"):
-            if not pv_payee and pv_amount <= 0:
-                st.error("Both Payee Name and Amount are missing — please fill in both.")
-            elif not pv_payee:
-                st.error(f"Payee Name is empty (currently: '{pv_payee}'). Type a name into the Payee Name field.")
-            elif pv_amount <= 0:
-                st.error(f"Amount is RM{pv_amount:.2f} — it needs to be more than RM0.00. "
-                         f"Check the Amount field wasn't left at its default.")
+            if not pv_payee or pv_amount <= 0:
+                st.error("Payee name and amount are required.")
             else:
                 # Insert directly via the Supabase client so we get the new row's id
                 # back immediately — needed for PV-{id:05d} voucher numbering and to
